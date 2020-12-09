@@ -10,7 +10,7 @@
 
 -include_lib("kernel/include/inet.hrl").
 
--export([is_ssl/1, ssl_info/1, controlling_process/2, getstat/2,
+-export([is_ssl/1, ssl_info/1, ssl_info/2, controlling_process/2, getstat/2,
     recv/1, sync_recv/2, async_recv/3, port_command/2, getopts/2,
     setopts/2, send/2, close/1, fast_close/1, sockname/1, peername/1,
     peercert/1, connection_string/2, socket_ends/2, is_loopback/1,
@@ -97,6 +97,11 @@ ssl_info(Sock) when ?IS_SSL(Sock) ->
     ssl:connection_information(Sock);
 ssl_info(_Sock) ->
     nossl.
+
+ssl_info(Sock, Items) when ?IS_SSL(Sock) ->
+  ssl:connection_information(Sock, Items);
+ssl_info(_Sock, _Items) ->
+  nossl.
 
 controlling_process(Sock, Pid) when ?IS_SSL(Sock) ->
     ssl:controlling_process(Sock, Pid);

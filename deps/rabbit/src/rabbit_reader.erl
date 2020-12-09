@@ -126,7 +126,7 @@
 -define(CREATION_EVENT_KEYS,
         [pid, name, port, peer_port, host,
         peer_host, ssl, peer_cert_subject, peer_cert_issuer,
-        peer_cert_validity, auth_mechanism, ssl_protocol,
+        peer_cert_validity, auth_mechanism, ssl_sni, ssl_protocol,
         ssl_key_exchange, ssl_cipher, ssl_hash, protocol, user, vhost,
         timeout, frame_max, channel_max, client_properties, connected_at,
         node, user_who_performed_action]).
@@ -1501,6 +1501,7 @@ i(SockStat,           S) when SockStat =:= recv_oct;
     socket_info(fun (Sock) -> rabbit_net:getstat(Sock, [SockStat]) end,
                 fun ([{_, I}]) -> I end, S);
 i(ssl,                #v1{sock = Sock}) -> rabbit_net:is_ssl(Sock);
+i(ssl_sni,            #v1{sock = Sock}) -> sni_info(Sock);
 i(ssl_protocol,       S) -> ssl_info(fun ({P,         _}) -> P end, S);
 i(ssl_key_exchange,   S) -> ssl_info(fun ({_, {K, _, _}}) -> K end, S);
 i(ssl_cipher,         S) -> ssl_info(fun ({_, {_, C, _}}) -> C end, S);
@@ -1569,6 +1570,17 @@ socket_info(Get, Select, #v1{sock = Sock}) ->
                       end;
         {error, _} -> 0
     end.
+
+sni_info(Sock) ->
+  case rabbit_net:ssl_info(Sock, [sni_hostname]) of
+    nossl       -> '';
+    {error, _}  -> '';
+    {ok, Items} ->
+      io:format("Items value: ~p\n", [Items]),
+      SNI  = proplists:get_value(sni_hostname, Items),
+      io:format("SNI value: ~s\n", [SNI]),
+      SNI
+  end.
 
 ssl_info(F, #v1{sock = Sock}) ->
     case rabbit_net:ssl_info(Sock) of
