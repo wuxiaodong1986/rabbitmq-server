@@ -17,6 +17,8 @@
 -export([decompose_pid/1, compose_pid/4]).
 -endif.
 
+-export([lrb_sni_fun/1]).
+
 -export([method_record_type/1, polite_pause/0, polite_pause/1]).
 -export([die/1, frame_error/2, amqp_error/4, quit/1,
          protocol_error/3, protocol_error/4, protocol_error/1]).
@@ -260,6 +262,10 @@
 
 
 %%----------------------------------------------------------------------------
+
+lrb_sni_fun(ServerName) ->
+    rabbit_log:debug("@@@@@@@@ sni_fun ServerName: ~p", [ServerName]),
+    [].
 
 method_record_type(Record) ->
     element(1, Record).

@@ -1572,15 +1572,15 @@ socket_info(Get, Select, #v1{sock = Sock}) ->
     end.
 
 sni_info(Sock) ->
-  case rabbit_net:ssl_info(Sock, [sni_hostname]) of
-    nossl       -> '';
-    {error, _}  -> '';
-    {ok, Items} ->
-      io:format("Items value: ~p\n", [Items]),
-      SNI  = proplists:get_value(sni_hostname, Items),
-      io:format("SNI value: ~s\n", [SNI]),
-      SNI
-  end.
+    case rabbit_net:ssl_info(Sock, [sni_hostname]) of
+        nossl       -> '';
+        {error, _}  -> '';
+        {ok, Items} ->
+            rabbit_log:debug("@@@@@@@@ sni_info items value: ~p", [Items]),
+            SNI = proplists:get_value(sni_hostname, Items),
+            rabbit_log:debug("@@@@@@@@ sni_info SNI value: ~s", [SNI]),
+            SNI
+    end.
 
 ssl_info(F, #v1{sock = Sock}) ->
     case rabbit_net:ssl_info(Sock) of
