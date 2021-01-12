@@ -10,829 +10,555 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
--compile(export_all).
+-include_lib("kernel/include/logger.hrl").
+-include_lib("rabbit_common/include/logging.hrl").
+-include_lib("amqp_client/include/amqp_client.hrl").
+
+-export([all/0,
+         init_per_suite/1,
+         end_per_suite/1,
+         init_per_group/2,
+         end_per_group/2,
+         init_per_testcase/2,
+         end_per_testcase/2,
+
+         logging_with_default_config_works/1,
+         logging_to_stdout_configured_in_env_works/1,
+         logging_to_stdout_configured_in_config_works/1,
+         logging_to_stderr_configured_in_env_works/1,
+         logging_to_exchange_works/1,
+         setting_log_levels_in_env_works/1,
+         setting_log_levels_in_config_works/1]).
 
 all() ->
-    [
-    default,
-    env_var_tty,
-    config_file_handler,
-    config_file_handler_level,
-    config_file_handler_rotation,
-    config_console_handler,
-    config_exchange_handler,
-    config_syslog_handler,
-    config_syslog_handler_options,
-    config_multiple_handlers,
+    [logging_with_default_config_works,
+     logging_to_stdout_configured_in_env_works,
+     logging_to_stdout_configured_in_config_works,
+     logging_to_stderr_configured_in_env_works,
+     logging_to_exchange_works,
+     setting_log_levels_in_env_works,
+     setting_log_levels_in_config_works].
 
-    env_var_overrides_config,
-    env_var_disable_log,
+init_per_suite(Config) ->
+    rabbit_ct_helpers:log_environment(),
+    rabbit_ct_helpers:run_setup_steps(Config).
 
-    config_sinks_level,
-    config_sink_file,
-    config_sink_file_override_config_handler_file,
-
-    config_handlers_merged_with_lager_handlers,
-    sink_handlers_merged_with_lager_extra_sinks_handlers,
-    sink_file_rewrites_file_backends
-    ].
-
-init_per_testcase(_, Config) ->
-    application:load(rabbit),
-    application:load(lager),
-    application:unset_env(rabbit, log),
-    application:unset_env(rabbit, lager_log_root),
-    application:unset_env(rabbit, lager_default_file),
-    application:unset_env(rabbit, lager_upgrade_file),
-    application:unset_env(lager, handlers),
-    application:unset_env(lager, rabbit_handlers),
-    application:unset_env(lager, extra_sinks),
-    unset_logs_var_origin(),
+end_per_suite(Config) ->
     Config.
 
+init_per_group(_, Config) ->
+    Config.
+
+end_per_group(_, Config) ->
+    Config.
+
+init_per_testcase(logging_to_exchange_works = Testcase, Config) ->
+    rabbit_ct_helpers:testcase_started(Config, Testcase),
+    Config1 = rabbit_ct_helpers:set_config(
+                Config,
+                [{rmq_nodes_count, 1},
+                 {rmq_nodename_suffix, Testcase}]),
+    Config2 = rabbit_ct_helpers:merge_app_env(
+                Config1,
+                {rabbit, [{log, [{exchange, [{enabled, true},
+                                             {level, info}]},
+                                 {file, [{level, info}]}]}]}),
+    rabbit_ct_helpers:run_steps(
+      Config2,
+      rabbit_ct_broker_helpers:setup_steps() ++
+      rabbit_ct_client_helpers:setup_steps());
+init_per_testcase(Testcase, Config) ->
+    remove_all_handlers(),
+    application:unset_env(rabbit, log),
+    LogBaseDir = filename:join(
+                   ?config(priv_dir, Config),
+                   atom_to_list(Testcase)),
+    Config1 = rabbit_ct_helpers:set_config(
+                Config, {log_base_dir, LogBaseDir}),
+    rabbit_ct_helpers:testcase_finished(Config1, Testcase).
+
+end_per_testcase(logging_to_exchange_works, Config) ->
+    rabbit_ct_helpers:run_steps(
+      Config,
+      rabbit_ct_client_helpers:teardown_steps() ++
+      rabbit_ct_broker_helpers:teardown_steps());
 end_per_testcase(_, Config) ->
     application:unset_env(rabbit, log),
-    application:unset_env(rabbit, lager_log_root),
-    application:unset_env(rabbit, lager_default_file),
-    application:unset_env(rabbit, lager_upgrade_file),
-    application:unset_env(lager, handlers),
-    application:unset_env(lager, rabbit_handlers),
-    application:unset_env(lager, extra_sinks),
-    unset_logs_var_origin(),
-    application:unload(rabbit),
-    application:unload(lager),
     Config.
 
-sink_file_rewrites_file_backends(_) ->
-    application:set_env(rabbit, log, [
-        %% Disable rabbit file handler
-        {file, [{file, false}]},
-        {categories, [{federation, [{file, "federation.log"}, {level, warning}]}]}
-    ]),
-
-    LagerHandlers = [
-        {lager_file_backend, [{file, "lager_file.log"}, {level, error}]},
-        {lager_file_backend, [{file, "lager_file_1.log"}, {level, error}]},
-        {lager_console_backend, [{level, info}]},
-        {lager_exchange_backend, [{level, info}]}
-    ],
-    application:set_env(lager, handlers, LagerHandlers),
-    rabbit_lager:configure_lager(),
-
-    ExpectedSinks = sort_sinks(sink_rewrite_sinks()),
-    ?assertEqual(ExpectedSinks, sort_sinks(application:get_env(lager, extra_sinks, undefined))).
-
-sink_rewrite_sinks() ->
-    [{error_logger_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_channel_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_connection_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_feature_flags_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_federation_lager_event,
-        [{handlers,[
-            {lager_file_backend,
-                    [{date, ""},
-                     {file, "federation.log"},
-                     {formatter_config, formatter_config(file)},
-                     {level, warning},
-                     {size, 0}]},
-            {lager_console_backend, [{level, warning}]},
-            {lager_exchange_backend, [{level, warning}]}
-        ]},
-         {rabbit_handlers,[
-            {lager_file_backend,
-                    [{date, ""},
-                     {file, "federation.log"},
-                     {formatter_config, formatter_config(file)},
-                     {level, warning},
-                     {size, 0}]},
-            {lager_console_backend, [{level, warning}]},
-            {lager_exchange_backend, [{level, warning}]}
-        ]}]},
-     {rabbit_log_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_ldap_lager_event,
-               [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-                {rabbit_handlers,
-                 [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_mirroring_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_osiris_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,
-        [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_prelaunch_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_queue_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_ra_lager_event,
-      [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-       {rabbit_handlers,
-        [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_shovel_lager_event,
-      [{handlers, [{lager_forwarder_backend,[lager_event,info]}]},
-       {rabbit_handlers,
-        [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_upgrade_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]}
-     ].
-
-sink_handlers_merged_with_lager_extra_sinks_handlers(_) ->
-    DefaultLevel = debug,
-    application:set_env(rabbit, log, [
-        {file,     [{file, "rabbit_file.log"}, {level, DefaultLevel}]},
-        {console,  [{enabled, true}, {level, error}]},
-        {exchange, [{enabled, true}, {level, error}]},
-        {categories, [
-            {connection, [{level, debug}]},
-            {channel, [{level, warning}, {file, "channel_log.log"}]}
-        ]}
-    ]),
-
-    LagerSinks = [
-        {rabbit_log_connection_lager_event,
-            [{handlers,
-                [{lager_file_backend,
-                    [{file, "connection_lager.log"},
-                     {level, info}]}]}]},
-        {rabbit_log_channel_lager_event,
-            [{handlers,
-                [{lager_console_backend, [{level, debug}]},
-                 {lager_exchange_backend, [{level, debug}]},
-                 {lager_file_backend, [{level, error},
-                                       {file, "channel_lager.log"}]}]}]}],
-
-    application:set_env(lager, extra_sinks, LagerSinks),
-    rabbit_lager:configure_lager(),
-
-    ExpectedSinks = sort_sinks([
-        {error_logger_lager_event,
-            [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-             {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-         {rabbit_log_channel_lager_event,
-            [{handlers,[
-                {lager_console_backend, [{level, error},
-                                         {formatter_config, formatter_config(console)}]},
-                {lager_exchange_backend, [{level, error},
-                                        {formatter_config, formatter_config(exchange)}]},
-                {lager_file_backend,
-                    [{date, ""},
-                     {file, "channel_log.log"},
-                     {formatter_config, formatter_config(file)},
-                     {level, warning},
-                     {size, 0}]},
-                {lager_console_backend, [{level, debug}]},
-                {lager_exchange_backend, [{level, debug}]},
-                {lager_file_backend, [{level, error},
-                                      {file, "channel_lager.log"}]}
-                ]},
-             {rabbit_handlers,[
-                {lager_console_backend, [{level, error},
-                                         {formatter_config, formatter_config(console)}]},
-                {lager_exchange_backend, [{level, error},
-                                        {formatter_config, formatter_config(exchange)}]},
-                {lager_file_backend,
-                    [{date, ""},
-                     {file, "channel_log.log"},
-                     {formatter_config, formatter_config(file)},
-                     {level, warning},
-                     {size, 0}]}]}
-             ]},
-         {rabbit_log_connection_lager_event,
-            [{handlers,[{lager_forwarder_backend,[lager_event,debug]},
-                        {lager_file_backend, [{file, "connection_lager.log"}, {level, info}]}]},
-             {rabbit_handlers,[{lager_forwarder_backend,[lager_event,debug]}]}]},
-         {rabbit_log_feature_flags_lager_event,
-            [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-             {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-         {rabbit_log_federation_lager_event,
-            [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-             {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-         {rabbit_log_lager_event,
-            [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-             {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-         {rabbit_log_ldap_lager_event,
-                   [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-                    {rabbit_handlers,
-                     [{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-         {rabbit_log_mirroring_lager_event,
-            [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-             {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-         {rabbit_log_osiris_lager_event,
-            [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-             {rabbit_handlers,
-            [{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-         {rabbit_log_prelaunch_lager_event,
-            [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-             {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-         {rabbit_log_queue_lager_event,
-            [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-             {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-         {rabbit_log_ra_lager_event,
-            [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-             {rabbit_handlers,
-            [{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-         {rabbit_log_shovel_lager_event,
-            [{handlers, [{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-             {rabbit_handlers,
-              [{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-         {rabbit_log_upgrade_lager_event,
-            [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-             {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]}]),
-
-    ?assertEqual(ExpectedSinks, sort_sinks(application:get_env(lager, extra_sinks, undefined))).
-
-config_handlers_merged_with_lager_handlers(_) ->
-    application:set_env(rabbit, log, [
-        {file,    [{file, "rabbit_file.log"}, {level, debug}]},
-        {console, [{enabled, true}, {level, error}]},
-        {exchange,  [{enabled, true}, {level, error}]},
-        {syslog,  [{enabled, true}]}
-    ]),
-
-    LagerHandlers = [
-        {lager_file_backend, [{file, "lager_file.log"}, {level, info}]},
-        {lager_console_backend, [{level, info}]},
-        {lager_exchange_backend, [{level, info}]},
-        {lager_exchange_backend, [{level, info}]}
-    ],
-    application:set_env(lager, handlers, LagerHandlers),
-    rabbit_lager:configure_lager(),
-
-    FileHandlers = default_expected_handlers("rabbit_file.log", debug),
-    ConsoleHandlers = expected_console_handler(error),
-    RabbitHandlers = expected_rabbit_handler(error),
-    SyslogHandlers = expected_syslog_handler(),
-
-    ExpectedRabbitHandlers = sort_handlers(FileHandlers ++ ConsoleHandlers ++ RabbitHandlers ++ SyslogHandlers),
-    ExpectedHandlers = sort_handlers(ExpectedRabbitHandlers ++ LagerHandlers),
-
-    ?assertEqual(ExpectedRabbitHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))).
-
-config_sinks_level(_) ->
-    DefaultLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, DefaultLogFile),
-
-    application:set_env(rabbit, log, [
-        {categories, [
-            {connection, [{level, warning}]},
-            {channel, [{level, debug}]},
-            {mirroring, [{level, error}]}
-        ]}
-    ]),
-
-    rabbit_lager:configure_lager(),
-
-    ExpectedSinks = sort_sinks(level_sinks()),
-    ?assertEqual(ExpectedSinks, sort_sinks(application:get_env(lager, extra_sinks, undefined))).
-
-level_sinks() ->
-    [{error_logger_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_channel_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,debug]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,debug]}]}]},
-     {rabbit_log_connection_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,warning]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,warning]}]}]},
-     {rabbit_log_feature_flags_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_federation_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_ldap_lager_event,
-               [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-                {rabbit_handlers,
-                 [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_mirroring_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,error]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,error]}]}]},
-     {rabbit_log_osiris_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,
-        [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_prelaunch_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_queue_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_ra_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,
-        [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_shovel_lager_event,
-        [{handlers, [{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,
-             [{lager_forwarder_backend,
-                  [lager_event,info]}]}]},
-     {rabbit_log_upgrade_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]}
-     ].
-
-config_sink_file(_) ->
-    DefaultLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, DefaultLogFile),
-
-    DefaultLevel = error,
-    application:set_env(rabbit, log, [
-        {console, [{enabled, true}]},
-        {exchange, [{enabled, true}]},
-        {file, [{level, DefaultLevel}]},
-        {categories, [
-            {connection, [{file, "connection.log"}, {level, warning}]}
-        ]}
-    ]),
-
-    rabbit_lager:configure_lager(),
-
-    ExpectedSinks = sort_sinks(file_sinks(DefaultLevel)),
-    ?assertEqual(ExpectedSinks, sort_sinks(application:get_env(lager, extra_sinks, undefined))).
-
-config_sink_file_override_config_handler_file(_) ->
-    DefaultLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, DefaultLogFile),
-
-    NonDefaultLogFile = "rabbit_not_default.log",
-
-    DefaultLevel = error,
-    application:set_env(rabbit, log, [
-        {file, [{file, NonDefaultLogFile}, {level, DefaultLevel}]},
-        {console, [{enabled, true}]},
-        {exchange, [{enabled, true}]},
-        {categories, [
-            {connection, [{file, "connection.log"}, {level, warning}]}
-        ]}
-    ]),
-
-    rabbit_lager:configure_lager(),
-
-    ExpectedSinks = sort_sinks(file_sinks(DefaultLevel)),
-    ?assertEqual(ExpectedSinks, sort_sinks(application:get_env(lager, extra_sinks, undefined))).
-
-file_sinks() ->
-    file_sinks(info).
-
-file_sinks(DefaultLevel) ->
-    [{error_logger_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_channel_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_connection_lager_event,
-        [{handlers,[
-            {lager_console_backend, [{level, warning},
-                                     {formatter_config, formatter_config(console)}]},
-            {lager_exchange_backend, [{level, warning},
-                                    {formatter_config, formatter_config(exchange)}]},
-            {lager_file_backend,
-                [{date, ""},
-                 {file, "connection.log"},
-                 {formatter_config, formatter_config(file)},
-                 {level, error},
-                 {size, 0}]}]},
-         {rabbit_handlers,[
-            {lager_console_backend, [{level, warning},
-                                     {formatter_config, formatter_config(console)}]},
-            {lager_exchange_backend, [{level, warning},
-                                    {formatter_config, formatter_config(exchange)}]},
-            {lager_file_backend,
-                [{date, ""},
-                 {file, "connection.log"},
-                 {formatter_config, formatter_config(backend)},
-                 {level, error},
-                 {size, 0}]}]}
-         ]},
-     {rabbit_log_feature_flags_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_federation_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_ldap_lager_event,
-               [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-                {rabbit_handlers,
-                 [{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_mirroring_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_osiris_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,
-        [{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_prelaunch_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_queue_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_ra_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,
-        [{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_shovel_lager_event,
-        [{handlers, [{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,
-          [{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]},
-     {rabbit_log_upgrade_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,DefaultLevel]}]}]}
-     ].
-
-config_multiple_handlers(_) ->
-    DefaultLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, DefaultLogFile),
-
-    application:set_env(rabbit, log, [
-        %% Disable file output
-        {file, [{file, false}]},
-        %% Enable console output
-        {console, [{enabled, true}]},
-        %% Enable exchange output
-        {exchange, [{enabled, true}]},
-        %% Enable a syslog output
-        {syslog, [{enabled, true}, {level, error}]}]),
-
-    rabbit_lager:configure_lager(),
-
-    ConsoleHandlers = expected_console_handler(),
-    RabbitHandlers = expected_rabbit_handler(),
-    SyslogHandlers = expected_syslog_handler(error),
-
-    ExpectedHandlers = sort_handlers(SyslogHandlers ++ ConsoleHandlers ++ RabbitHandlers),
-
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))).
-
-config_console_handler(_) ->
-    DefaultLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, DefaultLogFile),
-    application:set_env(rabbit, log, [{console, [{enabled, true}]}]),
-
-    rabbit_lager:configure_lager(),
-
-    FileHandlers = default_expected_handlers(DefaultLogFile),
-    ConsoleHandlers = expected_console_handler(),
-
-    ExpectedHandlers = sort_handlers(FileHandlers ++ ConsoleHandlers),
-
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))).
-
-config_exchange_handler(_) ->
-    DefaultLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, DefaultLogFile),
-    application:set_env(rabbit, log, [{exchange, [{enabled, true}]}]),
-
-    rabbit_lager:configure_lager(),
-
-    FileHandlers = default_expected_handlers(DefaultLogFile),
-    ExchangeHandlers = expected_rabbit_handler(),
-
-    ExpectedHandlers = sort_handlers(FileHandlers ++ ExchangeHandlers),
-
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))).
-
-expected_console_handler() ->
-    expected_console_handler(debug).
-
-expected_console_handler(Level) ->
-    [{lager_console_backend, [{level, Level},
-                              {formatter_config, formatter_config(console)}]}].
-
-expected_rabbit_handler() ->
-    expected_rabbit_handler(debug).
-
-expected_rabbit_handler(Level) ->
-    [{lager_exchange_backend, [{level, Level},
-                             {formatter_config, formatter_config(exchange)}]}].
-
-config_syslog_handler(_) ->
-    DefaultLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, DefaultLogFile),
-    application:set_env(rabbit, log, [{syslog, [{enabled, true}]}]),
-
-    rabbit_lager:configure_lager(),
-
-    FileHandlers = default_expected_handlers(DefaultLogFile),
-    SyslogHandlers = expected_syslog_handler(),
-
-    ExpectedHandlers = sort_handlers(FileHandlers ++ SyslogHandlers),
-
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))).
-
-config_syslog_handler_options(_) ->
-    DefaultLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, DefaultLogFile),
-    application:set_env(rabbit, log, [{syslog, [{enabled, true},
-                                                {level, warning}]}]),
-
-    rabbit_lager:configure_lager(),
-
-    FileHandlers = default_expected_handlers(DefaultLogFile),
-    SyslogHandlers = expected_syslog_handler(warning),
-
-    ExpectedHandlers = sort_handlers(FileHandlers ++ SyslogHandlers),
-
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))).
-
-expected_syslog_handler() ->
-    expected_syslog_handler(debug).
-
-expected_syslog_handler(Level) ->
-    [{syslog_lager_backend, [Level,
-                             {},
-                             {lager_default_formatter, syslog_formatter_config()}]}].
-
-env_var_overrides_config(_) ->
-    EnvLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, EnvLogFile),
-
-    ConfigLogFile = "rabbit_not_default.log",
-    application:set_env(rabbit, log, [{file, [{file, ConfigLogFile}]}]),
-
-    set_logs_var_origin(environment),
-    rabbit_lager:configure_lager(),
-
-    ExpectedHandlers = default_expected_handlers(EnvLogFile),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))).
-
-env_var_disable_log(_) ->
-    application:set_env(rabbit, lager_default_file, false),
-
-    ConfigLogFile = "rabbit_not_default.log",
-    application:set_env(rabbit, log, [{file, [{file, ConfigLogFile}]}]),
-
-    set_logs_var_origin(environment),
-    rabbit_lager:configure_lager(),
-
-    ExpectedHandlers = [],
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))).
-
-config_file_handler(_) ->
-    DefaultLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, DefaultLogFile),
-
-    NonDefaultLogFile = "rabbit_not_default.log",
-    application:set_env(rabbit, log, [{file, [{file, NonDefaultLogFile}]}]),
-
-    rabbit_lager:configure_lager(),
-
-    ExpectedHandlers = default_expected_handlers(NonDefaultLogFile),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))).
-
-config_file_handler_level(_) ->
-    DefaultLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, DefaultLogFile),
-
-    application:set_env(rabbit, log, [{file, [{level, warning}]}]),
-    rabbit_lager:configure_lager(),
-
-    ExpectedHandlers = default_expected_handlers(DefaultLogFile, warning),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))).
-
-config_file_handler_rotation(_) ->
-    DefaultLogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, DefaultLogFile),
-
-    application:set_env(rabbit, log, [{file, [{date, "$D0"}, {size, 5000}, {count, 10}]}]),
-    rabbit_lager:configure_lager(),
-
-    ExpectedHandlers = sort_handlers(default_expected_handlers(DefaultLogFile, debug, 5000, "$D0", [{count, 10}])),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))).
-
-default(_) ->
-    LogRoot = "/tmp/log_base",
-    application:set_env(rabbit, lager_log_root, LogRoot),
-    LogFile = "rabbit_default.log",
-    application:set_env(rabbit, lager_default_file, LogFile),
-    LogUpgradeFile = "rabbit_default_upgrade.log",
-    application:set_env(rabbit, lager_upgrade_file, LogUpgradeFile),
-
-    ?assertEqual(LogRoot, application:get_env(rabbit, lager_log_root, undefined)),
-    rabbit_lager:configure_lager(),
-
-    ExpectedHandlers = default_expected_handlers(LogFile),
-    ?assertEqual(LogRoot, application:get_env(lager, log_root, undefined)),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))),
-
-    ExpectedSinks = default_expected_sinks(LogUpgradeFile),
-    ?assertEqual(ExpectedSinks, sort_sinks(application:get_env(lager, extra_sinks, undefined))).
-
-default_expected_handlers(File) ->
-    default_expected_handlers(File, debug, 0, "").
-default_expected_handlers(File, Level) ->
-    default_expected_handlers(File, Level, 0, "").
-default_expected_handlers(File, Level, RotSize, RotDate) ->
-    default_expected_handlers(File, Level, RotSize, RotDate, []).
-default_expected_handlers(File, Level, RotSize, RotDate, Extra) ->
-    [{lager_file_backend,
-        [{date, RotDate},
-         {file, File},
-         {formatter_config, formatter_config(file)},
-         {level, Level},
-         {size, RotSize}] ++ Extra}].
-
-default_expected_sinks(UpgradeFile) ->
-    [{error_logger_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_channel_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_connection_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_feature_flags_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_federation_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_ldap_lager_event,
-               [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-                {rabbit_handlers,
-                 [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_mirroring_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_osiris_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,
-        [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_prelaunch_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_queue_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_ra_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,
-        [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_shovel_lager_event,
-        [{handlers, [{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,
-          [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_upgrade_lager_event,
-        [{handlers,
-            [{lager_file_backend,
-                [{date,[]},
-                 {file, UpgradeFile},
-                 {formatter_config, formatter_config(file)},
-                 {level,info},
-                 {size,0}]}]},
-         {rabbit_handlers,
-            [{lager_file_backend,
-                [{date,[]},
-                 {file, UpgradeFile},
-                 {formatter_config, formatter_config(file)},
-                 {level,info},
-                 {size,0}]}]}]}].
-
-env_var_tty(_) ->
-    application:set_env(rabbit, lager_log_root, "/tmp/log_base"),
-    application:set_env(rabbit, lager_default_file, tty),
-    application:set_env(rabbit, lager_upgrade_file, tty),
-    %% tty can only be set explicitly
-    set_logs_var_origin(environment),
-
-    rabbit_lager:configure_lager(),
-
-    ExpectedHandlers = tty_expected_handlers(),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, handlers, undefined))),
-    ?assertEqual(ExpectedHandlers, sort_handlers(application:get_env(lager, rabbit_handlers, undefined))),
-
-    %% Upgrade sink will be different.
-    ExpectedSinks = tty_expected_sinks(),
-    ?assertEqual(ExpectedSinks, sort_sinks(application:get_env(lager, extra_sinks, undefined))).
-
-set_logs_var_origin(Origin) ->
-    Context = #{var_origins => #{main_log_file => Origin}},
-    rabbit_prelaunch:store_context(Context),
+remove_all_handlers() ->
+    _ = [logger:remove_handler(Id)
+         || #{id := Id} <- logger:get_handler_config()].
+
+logging_with_default_config_works(Config) ->
+    Context = default_context(Config),
+    rabbit_prelaunch_logging:clear_config_run_number(),
+    rabbit_prelaunch_logging:setup(Context),
+
+    Handlers = logger:get_handler_config(),
+
+    MainFileHandler = get_handler_by_id(Handlers, rmq_1_file_1),
+    MainFile = main_log_file_in_context(Context),
+    ?assertNotEqual(undefined, MainFileHandler),
+    ?assertMatch(
+       #{level := info,
+         module := rabbit_logger_std_h,
+         filter_default := log,
+         filters := [{rmqlog_filter, {_, #{global := info,
+                                           upgrade := none}}}],
+         formatter := {rabbit_logger_text_fmt, _},
+         config := #{type := file,
+                     file := MainFile}},
+       MainFileHandler),
+
+    UpgradeFileHandler = get_handler_by_id(Handlers, rmq_1_file_2),
+    UpgradeFile = upgrade_log_file_in_context(Context),
+    ?assertNotEqual(undefined, UpgradeFileHandler),
+    ?assertMatch(
+       #{level := info,
+         module := rabbit_logger_std_h,
+         filter_default := stop,
+         filters := [{rmqlog_filter, {_, #{upgrade := info}}}],
+         formatter := {rabbit_logger_text_fmt, _},
+         config := #{type := file,
+                     file := UpgradeFile}},
+       UpgradeFileHandler),
+
+    ?assert(ping_log(rmq_1_file_1, info)),
+    ?assert(ping_log(rmq_1_file_1, info,
+                     #{domain => ?RMQLOG_DOMAIN_GLOBAL})),
+    ?assert(ping_log(rmq_1_file_1, info,
+                     #{domain => ['3rd_party']})),
+    ?assertNot(ping_log(rmq_1_file_1, info,
+                        #{domain => ?RMQLOG_DOMAIN_UPGRADE})),
+
+    ?assert(ping_log(rmq_1_file_2, info,
+                     #{domain => ?RMQLOG_DOMAIN_UPGRADE})),
+    ?assertNot(ping_log(rmq_1_file_2, info,
+                        #{domain => ?RMQLOG_DOMAIN_GLOBAL})),
     ok.
 
-unset_logs_var_origin() ->
-    rabbit_prelaunch:clear_context_cache(),
+logging_to_stdout_configured_in_env_works(Config) ->
+    #{var_origins := Origins0} = Context0 = default_context(Config),
+    Context = Context0#{main_log_file => "-",
+                        var_origins => Origins0#{
+                                         main_log_file => environment}},
+    logging_to_stddev_works(standard_io, rmq_1_stdout, Config, Context).
+
+logging_to_stdout_configured_in_config_works(Config) ->
+    Context = default_context(Config),
+    ok = application:set_env(
+           rabbit, log,
+           [{console, [{enabled, true}]}],
+           [{persistent, true}]),
+    logging_to_stddev_works(standard_io, rmq_1_stdout, Config, Context).
+
+logging_to_stderr_configured_in_env_works(Config) ->
+    #{var_origins := Origins0} = Context0 = default_context(Config),
+    Context = Context0#{main_log_file => "-stderr",
+                        var_origins => Origins0#{
+                                         main_log_file => environment}},
+    logging_to_stddev_works(standard_error, rmq_1_stderr, Config, Context).
+
+logging_to_stddev_works(Stddev, Id, Config, Context) ->
+    rabbit_prelaunch_logging:clear_config_run_number(),
+    rabbit_prelaunch_logging:setup(Context),
+
+    Handlers = logger:get_handler_config(),
+
+    StddevHandler = get_handler_by_id(Handlers, Id),
+    ?assertNotEqual(undefined, StddevHandler),
+    ?assertMatch(
+       #{level := info,
+         module := rabbit_logger_std_h,
+         filter_default := log,
+         filters := [{rmqlog_filter, {_, #{global := info,
+                                           upgrade := none}}}],
+         formatter := {rabbit_logger_text_fmt, _},
+         config := #{type := Stddev}},
+       StddevHandler),
+
+    UpgradeFileHandler = get_handler_by_id(Handlers, rmq_1_file_1),
+    UpgradeFile = upgrade_log_file_in_context(Context),
+    ?assertNotEqual(undefined, UpgradeFileHandler),
+    ?assertMatch(
+       #{level := info,
+         module := rabbit_logger_std_h,
+         filter_default := stop,
+         filters := [{rmqlog_filter, {_, #{upgrade := info}}}],
+         formatter := {rabbit_logger_text_fmt, _},
+         config := #{type := file,
+                     file := UpgradeFile}},
+       UpgradeFileHandler),
+
+    ?assert(ping_log(Id, info, Config)),
+    ?assert(ping_log(Id, info,
+                     #{domain => ?RMQLOG_DOMAIN_GLOBAL}, Config)),
+    ?assert(ping_log(Id, info,
+                     #{domain => ['3rd_party']}, Config)),
+    ?assertNot(ping_log(Id, info,
+                        #{domain => ?RMQLOG_DOMAIN_UPGRADE}, Config)),
+
+    ?assert(ping_log(rmq_1_file_1, info,
+                     #{domain => ?RMQLOG_DOMAIN_UPGRADE})),
+    ?assertNot(ping_log(rmq_1_file_1, info,
+                        #{domain => ?RMQLOG_DOMAIN_GLOBAL})),
     ok.
 
-tty_expected_handlers() ->
-    [{lager_console_backend,
-        [{formatter_config, formatter_config(console)},
-         {level, debug}]}].
+logging_to_exchange_works(Config) ->
+    Context = rabbit_ct_broker_helpers:rpc(
+                Config, 0,
+                rabbit_prelaunch, get_context, []),
+    Handlers = rabbit_ct_broker_helpers:rpc(
+                 Config, 0,
+                 logger, get_handler_config, []),
+    ct:pal("Handlers = ~p", [Handlers]),
 
-tty_expected_sinks() ->
-    [{error_logger_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_channel_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_connection_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_feature_flags_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_federation_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_lager_event,
-        [{handlers, [{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers, [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_ldap_lager_event,
-               [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-                {rabbit_handlers,
-                 [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_mirroring_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_osiris_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,
-        [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_prelaunch_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_queue_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_ra_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,
-        [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_shovel_lager_event,
-        [{handlers, [{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,
-          [{lager_forwarder_backend,[lager_event,info]}]}]},
-     {rabbit_log_upgrade_lager_event,
-        [{handlers,[{lager_forwarder_backend,[lager_event,info]}]},
-         {rabbit_handlers,[{lager_forwarder_backend,[lager_event,info]}]}]}].
+    ExchangeHandler = get_handler_by_id(Handlers, rmq_1_exchange),
+    ?assertNotEqual(undefined, ExchangeHandler),
+    ?assertMatch(
+       #{level := info,
+         module := rabbit_logger_exchange_h,
+         filter_default := log,
+         filters := [{rmqlog_filter, {_, #{global := info,
+                                           upgrade := none}}}],
+         formatter := {rabbit_logger_text_fmt, _},
+         config := #{exchange := _}},
+       ExchangeHandler),
+    #{config :=
+      #{exchange := #resource{name = XName} = Exchange}} = ExchangeHandler,
 
-sort_sinks(Sinks) ->
-    lists:ukeysort(1,
-        lists:map(
-            fun({Name, Config}) ->
-                Handlers = proplists:get_value(handlers, Config),
-                RabbitHandlers = proplists:get_value(rabbit_handlers, Config),
-                {Name, lists:ukeymerge(1,
-                            [{handlers, sort_handlers(Handlers)},
-                             {rabbit_handlers, sort_handlers(RabbitHandlers)}],
-                            lists:ukeysort(1, Config))}
-            end,
-            Sinks)).
+    UpgradeFileHandler = get_handler_by_id(Handlers, rmq_1_file_2),
+    UpgradeFile = upgrade_log_file_in_context(Context),
+    ?assertNotEqual(undefined, UpgradeFileHandler),
+    ?assertMatch(
+       #{level := info,
+         module := rabbit_logger_std_h,
+         filter_default := stop,
+         filters := [{rmqlog_filter, {_, #{upgrade := info}}}],
+         formatter := {rabbit_logger_text_fmt, _},
+         config := #{type := file,
+                     file := UpgradeFile}},
+       UpgradeFileHandler),
 
-sort_handlers(Handlers) ->
-    lists:keysort(1,
-        lists:map(
-            fun
-            ({Name, [{Atom, _}|_] = Config}) when is_atom(Atom) ->
-                {Name, lists:ukeysort(1, Config)};
-            %% Non-proplist configuration. forwarder backend
-            (Other) ->
-                Other
-            end,
-            Handlers)).
+    %% Wait for the expected exchange to be automatically declared.
+    lists:any(
+      fun(_) ->
+              Ret = rabbit_ct_broker_helpers:rpc(
+                      Config, 0,
+                      rabbit_exchange, lookup, [Exchange]),
+              case Ret of
+                  {ok, _} -> true;
+                  _       -> timer:sleep(500),
+                             false
+              end
+      end, lists:seq(1, 20)),
 
-formatter_config(console) ->
-    [date," ",time," ",color,"[",severity, "] ", {pid,[]}, " ",message,"\r\n"];
-formatter_config(_) ->
-    [date," ",time," ",color,"[",severity, "] ", {pid,[]}, " ",message,"\n"].
+    %% Declare a queue to collect all logged messages.
+    {Conn, Chan} = rabbit_ct_client_helpers:open_connection_and_channel(
+                     Config),
+    QName = <<"log-messages">>,
+    ?assertMatch(
+       #'queue.declare_ok'{},
+       amqp_channel:call(Chan, #'queue.declare'{queue = QName,
+                                                durable = false})),
+    ?assertMatch(
+       #'queue.bind_ok'{},
+       amqp_channel:call(Chan, #'queue.bind'{queue = QName,
+                                             exchange = XName,
+                                             routing_key = <<"#">>})),
+    Config1 = rabbit_ct_helpers:set_config(
+                Config, {test_channel_and_queue, {Chan, QName}}),
 
-syslog_formatter_config() ->
-    [color,"[",severity, "] ", {pid,[]}, " ",message,"\n"].
+    ?assert(ping_log(rmq_1_exchange, info, Config1)),
+    ?assert(ping_log(rmq_1_exchange, info,
+                     #{domain => ?RMQLOG_DOMAIN_GLOBAL}, Config1)),
+    ?assert(ping_log(rmq_1_exchange, info,
+                     #{domain => ['3rd_party']}, Config1)),
+    ?assertNot(ping_log(rmq_1_exchange, info,
+                        #{domain => ?RMQLOG_DOMAIN_UPGRADE}, Config1)),
+
+    ?assert(ping_log(rmq_1_file_2, info,
+                     #{domain => ?RMQLOG_DOMAIN_UPGRADE}, Config)),
+    ?assertNot(ping_log(rmq_1_file_2, info,
+                        #{domain => ?RMQLOG_DOMAIN_GLOBAL}, Config)),
+
+    amqp_channel:call(Chan, #'queue.delete'{queue = QName}),
+    rabbit_ct_client_helpers:close_connection_and_channel(Conn, Chan),
+    ok.
+
+setting_log_levels_in_env_works(Config) ->
+    GlobalLevel = warning,
+    PrelaunchLevel = error,
+    MinLevel = rabbit_prelaunch_logging:get_less_severe_level(
+                 GlobalLevel, PrelaunchLevel),
+    #{var_origins := Origins0} = Context0 = default_context(Config),
+    Context = Context0#{log_levels => #{global => GlobalLevel,
+                                        "prelaunch" => PrelaunchLevel},
+                        var_origins => Origins0#{log_levels => environment}},
+    rabbit_prelaunch_logging:clear_config_run_number(),
+    rabbit_prelaunch_logging:setup(Context),
+
+    Handlers = logger:get_handler_config(),
+
+    MainFileHandler = get_handler_by_id(Handlers, rmq_1_file_1),
+    MainFile = main_log_file_in_context(Context),
+    ?assertNotEqual(undefined, MainFileHandler),
+    ?assertMatch(
+       #{level := MinLevel,
+         module := rabbit_logger_std_h,
+         filter_default := log,
+         filters := [{rmqlog_filter, {_, #{global := GlobalLevel,
+                                           prelaunch := PrelaunchLevel,
+                                           upgrade := none}}}],
+         formatter := {rabbit_logger_text_fmt, _},
+         config := #{type := file,
+                     file := MainFile}},
+       MainFileHandler),
+
+    UpgradeFileHandler = get_handler_by_id(Handlers, rmq_1_file_2),
+    UpgradeFile = upgrade_log_file_in_context(Context),
+    ?assertNotEqual(undefined, UpgradeFileHandler),
+    ?assertMatch(
+       #{level := info,
+         module := rabbit_logger_std_h,
+         filter_default := stop,
+         filters := [{rmqlog_filter, {_, #{upgrade := info}}}],
+         formatter := {rabbit_logger_text_fmt, _},
+         config := #{type := file,
+                     file := UpgradeFile}},
+       UpgradeFileHandler),
+
+    ?assertNot(ping_log(rmq_1_file_1, info)),
+    ?assertNot(ping_log(rmq_1_file_1, info,
+                        #{domain => ?RMQLOG_DOMAIN_GLOBAL})),
+    ?assertNot(ping_log(rmq_1_file_1, info,
+                        #{domain => ?RMQLOG_DOMAIN_PRELAUNCH})),
+    ?assertNot(ping_log(rmq_1_file_1, GlobalLevel,
+                        #{domain => ?RMQLOG_DOMAIN_PRELAUNCH})),
+    ?assertNot(ping_log(rmq_1_file_1, info,
+                        #{domain => ['3rd_party']})),
+    ?assertNot(ping_log(rmq_1_file_1, info,
+                        #{domain => ?RMQLOG_DOMAIN_UPGRADE})),
+
+    ?assert(ping_log(rmq_1_file_1, GlobalLevel)),
+    ?assert(ping_log(rmq_1_file_1, GlobalLevel,
+                     #{domain => ?RMQLOG_DOMAIN_GLOBAL})),
+    ?assert(ping_log(rmq_1_file_1, PrelaunchLevel,
+                     #{domain => ?RMQLOG_DOMAIN_PRELAUNCH})),
+    ?assert(ping_log(rmq_1_file_1, GlobalLevel,
+                     #{domain => ['3rd_party']})),
+    ?assertNot(ping_log(rmq_1_file_1, GlobalLevel,
+                        #{domain => ?RMQLOG_DOMAIN_UPGRADE})),
+
+    ?assert(ping_log(rmq_1_file_2, GlobalLevel,
+                     #{domain => ?RMQLOG_DOMAIN_UPGRADE})),
+    ?assertNot(ping_log(rmq_1_file_2, GlobalLevel,
+                        #{domain => ?RMQLOG_DOMAIN_GLOBAL})),
+    ok.
+
+setting_log_levels_in_config_works(Config) ->
+    GlobalLevel = warning,
+    PrelaunchLevel = error,
+    MinLevel = rabbit_prelaunch_logging:get_less_severe_level(
+                 GlobalLevel, PrelaunchLevel),
+    Context = default_context(Config),
+    ok = application:set_env(
+           rabbit, log,
+           [{file, [{level, GlobalLevel}]},
+            {categories, [{prelaunch, [{level, PrelaunchLevel}]}]}],
+           [{persistent, true}]),
+    rabbit_prelaunch_logging:clear_config_run_number(),
+    rabbit_prelaunch_logging:setup(Context),
+
+    Handlers = logger:get_handler_config(),
+
+    MainFileHandler = get_handler_by_id(Handlers, rmq_1_file_1),
+    MainFile = main_log_file_in_context(Context),
+    ?assertNotEqual(undefined, MainFileHandler),
+    ?assertMatch(
+       #{level := MinLevel,
+         module := rabbit_logger_std_h,
+         filter_default := log,
+         filters := [{rmqlog_filter, {_, #{global := GlobalLevel,
+                                           prelaunch := PrelaunchLevel,
+                                           upgrade := none}}}],
+         formatter := {rabbit_logger_text_fmt, _},
+         config := #{type := file,
+                     file := MainFile}},
+       MainFileHandler),
+
+    UpgradeFileHandler = get_handler_by_id(Handlers, rmq_1_file_2),
+    UpgradeFile = upgrade_log_file_in_context(Context),
+    ?assertNotEqual(undefined, UpgradeFileHandler),
+    ?assertMatch(
+       #{level := info,
+         module := rabbit_logger_std_h,
+         filter_default := stop,
+         filters := [{rmqlog_filter, {_, #{upgrade := info}}}],
+         formatter := {rabbit_logger_text_fmt, _},
+         config := #{type := file,
+                     file := UpgradeFile}},
+       UpgradeFileHandler),
+
+    ?assertNot(ping_log(rmq_1_file_1, info)),
+    ?assertNot(ping_log(rmq_1_file_1, info,
+                        #{domain => ?RMQLOG_DOMAIN_GLOBAL})),
+    ?assertNot(ping_log(rmq_1_file_1, info,
+                        #{domain => ?RMQLOG_DOMAIN_PRELAUNCH})),
+    ?assertNot(ping_log(rmq_1_file_1, GlobalLevel,
+                        #{domain => ?RMQLOG_DOMAIN_PRELAUNCH})),
+    ?assertNot(ping_log(rmq_1_file_1, info,
+                        #{domain => ['3rd_party']})),
+    ?assertNot(ping_log(rmq_1_file_1, info,
+                        #{domain => ?RMQLOG_DOMAIN_UPGRADE})),
+
+    ?assert(ping_log(rmq_1_file_1, GlobalLevel)),
+    ?assert(ping_log(rmq_1_file_1, GlobalLevel,
+                     #{domain => ?RMQLOG_DOMAIN_GLOBAL})),
+    ?assert(ping_log(rmq_1_file_1, PrelaunchLevel,
+                     #{domain => ?RMQLOG_DOMAIN_PRELAUNCH})),
+    ?assert(ping_log(rmq_1_file_1, GlobalLevel,
+                     #{domain => ['3rd_party']})),
+    ?assertNot(ping_log(rmq_1_file_1, GlobalLevel,
+                        #{domain => ?RMQLOG_DOMAIN_UPGRADE})),
+
+    ?assert(ping_log(rmq_1_file_2, GlobalLevel,
+                     #{domain => ?RMQLOG_DOMAIN_UPGRADE})),
+    ?assertNot(ping_log(rmq_1_file_2, GlobalLevel,
+                        #{domain => ?RMQLOG_DOMAIN_GLOBAL})),
+    ok.
+
+%% -------------------------------------------------------------------
+%% Internal functions.
+%% -------------------------------------------------------------------
+
+default_context(Config) ->
+    LogBaseDir = ?config(log_base_dir, Config),
+    MainFile = "rabbit.log",
+    UpgradeFile = "rabbit_upgrade.log",
+    #{log_base_dir => LogBaseDir,
+      main_log_file => MainFile,
+      upgrade_log_file => UpgradeFile,
+      log_levels => undefined,
+      var_origins => #{log_base_dir => default,
+                       main_log_file => default,
+                       upgrade_log_file => default,
+                       log_levels => default}}.
+
+main_log_file_in_context(#{log_base_dir := LogBaseDir,
+                           main_log_file := MainLogFile}) ->
+    filename:join(LogBaseDir, MainLogFile).
+
+upgrade_log_file_in_context(#{log_base_dir := LogBaseDir,
+                              upgrade_log_file := UpgradeLogFile}) ->
+    filename:join(LogBaseDir, UpgradeLogFile).
+
+get_handler_by_id([#{id := Id} = Handler | _], Id) ->
+    Handler;
+get_handler_by_id([_ | Rest], Id) ->
+    get_handler_by_id(Rest, Id);
+get_handler_by_id([], _) ->
+    undefined.
+
+ping_log(Id, Level) ->
+    ping_log(Id, Level, #{}, []).
+
+ping_log(Id, Level, Metadata) when is_map(Metadata) ->
+    ping_log(Id, Level, Metadata, []);
+ping_log(Id, Level, Config) when is_list(Config) ->
+    ping_log(Id, Level, #{}, Config).
+
+ping_log(Id, Level, Metadata, Config) ->
+    RandomMsg = get_random_string(
+                  32,
+                  "abcdefghijklmnopqrstuvwxyz"
+                  "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    ct:log("Logging \"~ts\" at level ~ts", [RandomMsg, Level]),
+    case need_rpc(Config) of
+        false -> logger:log(Level, RandomMsg, Metadata);
+        true  -> rabbit_ct_broker_helpers:rpc(
+                   Config, 0,
+                   logger, log, [Level, RandomMsg, Metadata])
+    end,
+    check_log(Id, RandomMsg, Config).
+
+need_rpc(Config) ->
+    rabbit_ct_helpers:get_config(
+      Config, rmq_nodes_count) =/= undefined.
+
+check_log(Id, RandomMsg, Config) ->
+    {ok, Handler} = case need_rpc(Config) of
+                        false -> logger:get_handler_config(Id);
+                        true  -> rabbit_ct_broker_helpers:rpc(
+                                   Config, 0,
+                                   logger, get_handler_config, [Id])
+                    end,
+    check_log1(Handler, RandomMsg, Config).
+
+check_log1(#{id := Id,
+             module := rabbit_logger_std_h,
+             config := #{type := file,
+                         file := Filename}},
+           RandomMsg,
+           Config) ->
+    ok = case need_rpc(Config) of
+             false -> rabbit_logger_std_h:filesync(Id);
+             true  -> rabbit_ct_broker_helpers:rpc(
+                        Config, 0,
+                        rabbit_logger_std_h, filesync, [Id])
+         end,
+    {ok, Content} = file:read_file(Filename),
+    ReOpts = [{capture, none}, multiline],
+    match =:= re:run(Content, RandomMsg ++ "$", ReOpts);
+check_log1(#{module := Mod,
+             config := #{type := Stddev}},
+           RandomMsg,
+           Config)
+  when ?IS_STD_H_COMPAT(Mod) andalso ?IS_STDDEV(Stddev) ->
+    Filename = html_report_filename(Config),
+    ReOpts = [{capture, none}, multiline],
+    lists:any(
+      fun(_) ->
+              {ok, Content} = file:read_file(Filename),
+              case re:run(Content, RandomMsg ++ "$", ReOpts) of
+                  match -> true;
+                  _     -> timer:sleep(500),
+                           false
+              end
+      end, lists:seq(1, 10));
+check_log1(#{module := rabbit_logger_exchange_h},
+           RandomMsg,
+           Config) ->
+    {Chan, QName} = ?config(test_channel_and_queue, Config),
+    ReOpts = [{capture, none}, multiline],
+    lists:any(
+      fun(_) ->
+              Ret = amqp_channel:call(
+                      Chan, #'basic.get'{queue = QName, no_ack = false}),
+              case Ret of
+                  {#'basic.get_ok'{}, #amqp_msg{payload = Content}} ->
+                      case re:run(Content, RandomMsg ++ "$", ReOpts) of
+                          match -> true;
+                          _     -> timer:sleep(500),
+                                   false
+                      end;
+                  #'basic.get_empty'{} ->
+                      timer:sleep(500),
+                      false;
+                  Other ->
+                      io:format(standard_error, "OTHER -> ~p~n", [Other]),
+                      timer:sleep(500),
+                      false
+              end
+      end, lists:seq(1, 10)).
+
+get_random_string(Length, AllowedChars) ->
+    lists:foldl(fun(_, Acc) ->
+                        [lists:nth(rand:uniform(length(AllowedChars)),
+                                   AllowedChars)]
+                        ++ Acc
+                end, [], lists:seq(1, Length)).
+
+html_report_filename(Config) ->
+    ?config(tc_logfile, Config).

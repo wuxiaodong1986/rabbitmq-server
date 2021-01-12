@@ -8,6 +8,7 @@
 -module(rabbit_env).
 
 -include_lib("kernel/include/file.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -export([get_context/0,
          get_context/1,
@@ -17,6 +18,8 @@
          get_context_after_reloading_env/1,
          dbg_config/0,
          env_vars/0,
+         has_var_been_overridden/1,
+         has_var_been_overridden/2,
          get_used_env_vars/0,
          log_process_env/0,
          log_context/1,
@@ -74,6 +77,10 @@
          "RABBITMQ_USE_LONGNAME",
          "SYS_PREFIX"
         ]).
+
+-export_type([context/0]).
+
+-type context() :: map().
 
 get_context() ->
     Context0 = get_context_before_logging_init(),
@@ -225,24 +232,33 @@ env_vars() ->
         false -> os:env()            %% OTP >= 24
     end.
 
+has_var_been_overridden(Var) ->
+    has_var_been_overridden(get_context(), Var).
+
+has_var_been_overridden(#{var_origins := Origins}, Var) ->
+    case maps:get(Var, Origins, default) of
+        default -> false;
+        _       -> true
+    end.
+
 get_used_env_vars() ->
     lists:filter(
       fun({Var, _}) -> var_is_used(Var) end,
       lists:sort(env_vars())).
 
 log_process_env() ->
-    rabbit_log_prelaunch:debug("Process environment:"),
+    ?LOG_DEBUG("Process environment:"),
     lists:foreach(
       fun({Var, Value}) ->
-              rabbit_log_prelaunch:debug("  - ~s = ~ts", [Var, Value])
+              ?LOG_DEBUG("  - ~s = ~ts", [Var, Value])
       end, lists:sort(env_vars())).
 
 log_context(Context) ->
-    rabbit_log_prelaunch:debug("Context (based on environment variables):"),
+    ?LOG_DEBUG("Context (based on environment variables):"),
     lists:foreach(
       fun(Key) ->
               Value = maps:get(Key, Context),
-              rabbit_log_prelaunch:debug("  - ~s: ~p", [Key, Value])
+              ?LOG_DEBUG("  - ~s: ~p", [Key, Value])
       end,
       lists:sort(maps:keys(Context))).
 
@@ -622,6 +638,12 @@ parse_log_levels([CategoryValue | Rest], Result) ->
             parse_log_levels(Rest, Result1);
         ["-color"] ->
             Result1 = Result#{color => false},
+            parse_log_levels(Rest, Result1);
+        ["+json"] ->
+            Result1 = Result#{json => true},
+            parse_log_levels(Rest, Result1);
+        ["-json"] ->
+            Result1 = Result#{json => false},
             parse_log_levels(Rest, Result1);
         [CategoryOrLevel] ->
             case parse_level(CategoryOrLevel) of

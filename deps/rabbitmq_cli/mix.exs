@@ -36,7 +36,6 @@ defmodule RabbitMQCtl.MixfileBase do
           :rabbit_event,
           :rabbit_file,
           :rabbit_net,
-          :rabbit_lager,
           :rabbit_log,
           :rabbit_misc,
           :rabbit_mnesia,
@@ -160,12 +159,6 @@ defmodule RabbitMQCtl.MixfileBase do
           {
             :goldrush,
             path: Path.join(deps_dir, "goldrush"),
-            compile: false,
-            override: true
-          },
-          {
-            :lager,
-            path: Path.join(deps_dir, "lager"),
             compile: false,
             override: true
           },
