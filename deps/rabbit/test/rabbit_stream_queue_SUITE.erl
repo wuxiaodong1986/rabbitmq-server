@@ -445,6 +445,7 @@ delete_down_replica(Config) ->
     %% check it isn't gone
     check_leader_and_replicas(Config, Q, Server0, [Server1, Server2]),
     ok = rabbit_ct_broker_helpers:start_node(Config, Server1),
+    timer:sleep(5000),
     ?assertEqual(ok,
                  rpc:call(Server0, rabbit_stream_queue, delete_replica,
                           [<<"/">>, Q, Server1])).
@@ -1198,16 +1199,16 @@ leader_failover(Config) ->
 leader_failover_dedupe(Config) ->
     %% tests that in-flight messages are automatically handled in the case where
     %% a leader change happens during publishing
-    [Server1, Server2, Server3] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
-    Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server1),
+    [_Server1, DownNode, PubNode] = Nodes = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Ch1 = rabbit_ct_client_helpers:open_channel(Config, DownNode),
     Q = ?config(queue_name, Config),
 
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Ch1, Q, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
 
-    check_leader_and_replicas(Config, Q, Server1, [Server2, Server3]),
+    check_leader_and_replicas(Config, Q, DownNode, lists:delete(DownNode, Nodes)),
 
-    Ch2 = rabbit_ct_client_helpers:open_channel(Config, Server2),
+    Ch2 = rabbit_ct_client_helpers:open_channel(Config, PubNode),
     #'confirm.select_ok'{} = amqp_channel:call(Ch2, #'confirm.select'{}),
 
     Self= self(),
@@ -1234,23 +1235,27 @@ leader_failover_dedupe(Config) ->
     erlang:monitor(process, Pid),
     Pid ! go,
     timer:sleep(10),
-    ok = rabbit_ct_broker_helpers:stop_node(Config, Server1),
+    ok = rabbit_ct_broker_helpers:stop_node(Config, DownNode),
     %% this should cause a new leader to be elected and the channel on node 2
     %% to have to resend any pending messages to ensure none is lost
     timer:sleep(30000),
+    ct:pal("preinfo", []),
     [Info] = lists:filter(
                fun(Props) ->
                        QName = rabbit_misc:r(<<"/">>, queue, Q),
                        lists:member({name, QName}, Props)
                end,
-               rabbit_ct_broker_helpers:rpc(Config, 1, rabbit_amqqueue,
-                                            info_all, [<<"/">>, [name, leader, members]])),
+               rabbit_ct_broker_helpers:rpc(Config, PubNode, rabbit_amqqueue,
+                                            info_all,
+                                            [<<"/">>, [name, leader, members]])),
+    ct:pal("info ~p", [Info]),
     NewLeader = proplists:get_value(leader, Info),
-    ?assert(NewLeader =/= Server1),
+    ?assert(NewLeader =/= DownNode),
     flush(),
     ?assert(erlang:is_process_alive(Pid)),
+    ct:pal("stopping"),
     Pid ! stop,
-    ok = rabbit_ct_broker_helpers:start_node(Config, Server1),
+    ok = rabbit_ct_broker_helpers:start_node(Config, DownNode),
 
     N = receive
             {last_msg, X} -> X

@@ -325,6 +325,7 @@ handle_event({osiris_written, From, _WriterId, Corrs},
                           fun (_Seq, {I, _M}, Acc) ->
                                   [I | Acc]
                           end, [], maps:with(Corrs, Correlation0))),
+
     Correlation = maps:without(Corrs, Correlation0),
     Slow = case maps:size(Correlation) < SftLmt of
                true when Slow0 ->
@@ -552,7 +553,7 @@ delete_replica(VHost, Name, Node) ->
 
 make_stream_conf(Node, Q) ->
     QName = amqqueue:get_name(Q),
-    Name = queue_name(QName),
+    Name = stream_name(QName),
     %% MaxLength = args_policy_lookup(<<"max-length">>, fun min/2, Q),
     MaxBytes = args_policy_lookup(<<"max-length-bytes">>, fun min/2, Q),
     MaxAge = max_age(args_policy_lookup(<<"max-age">>, fun max_age/2, Q)),
@@ -636,7 +637,7 @@ initial_cluster_size(Val) ->
 res_arg(PolVal, undefined) -> PolVal;
 res_arg(_, ArgVal) ->  ArgVal.
 
-queue_name(#resource{virtual_host = VHost, name = Name}) ->
+stream_name(#resource{virtual_host = VHost, name = Name}) ->
     Timestamp = erlang:integer_to_binary(erlang:system_time()),
     osiris_util:to_base64uri(erlang:binary_to_list(<<VHost/binary, "_", Name/binary, "_",
                                                      Timestamp/binary>>)).
