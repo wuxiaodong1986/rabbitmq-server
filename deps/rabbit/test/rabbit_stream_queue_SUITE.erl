@@ -253,13 +253,15 @@ declare_queue(Config) ->
 
     %% Test declare an existing queue
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
-                 declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
+                declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
 
     ?assertMatch([_], rpc:call(Server, supervisor, which_children,
                                [osiris_server_sup])),
 
     %% Test declare an existing queue with different arguments
-    ?assertExit(_, declare(Ch, Q, [])).
+    ?assertExit(_, declare(Ch, Q, [])),
+    ok.
+
 
 delete_queue(Config) ->
     [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
@@ -316,7 +318,8 @@ add_replica(Config) ->
                           [<<"/">>, Q, Server1])),
     %% replicas must be recorded on the state, and if we publish messages then they must
     %% be stored on disk
-    check_leader_and_replicas(Config, Q, Server0, [Server1]),
+    timer:sleep(2000),
+    check_leader_and_replicas(Config, Q, [Server0, Server1]),
     %% And if we try again? Idempotent
     ?assertEqual(ok, rpc:call(Server0, rabbit_stream_queue, add_replica,
                               [<<"/">>, Q, Server1])),
@@ -326,7 +329,8 @@ add_replica(Config) ->
     rabbit_control_helper:command(start_app, Server2),
     ?assertEqual(ok, rpc:call(Server0, rabbit_stream_queue, add_replica,
                               [<<"/">>, Q, Server2])),
-    check_leader_and_replicas(Config, Q, Server0, [Server1, Server2]).
+    timer:sleep(2000),
+    check_leader_and_replicas(Config, Q, [Server0, Server1, Server2]).
 
 delete_replica(Config) ->
     [Server0, Server1, Server2] =
@@ -335,7 +339,7 @@ delete_replica(Config) ->
     Q = ?config(queue_name, Config),
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
-    check_leader_and_replicas(Config, Q, Server0, [Server1, Server2]),
+    check_leader_and_replicas(Config, Q, [Server0, Server1, Server2]),
     %% Not a member of the cluster, what would happen?
     ?assertEqual({error, node_not_running},
                  rpc:call(Server0, rabbit_stream_queue, delete_replica,
@@ -343,15 +347,17 @@ delete_replica(Config) ->
     ?assertEqual(ok,
                  rpc:call(Server0, rabbit_stream_queue, delete_replica,
                           [<<"/">>, Q, Server1])),
+    timer:sleep(2000),
     %% check it's gone
-    check_leader_and_replicas(Config, Q, Server0, [Server2]),
+    check_leader_and_replicas(Config, Q, [Server0, Server2]),
     %% And if we try again? Idempotent
     ?assertEqual(ok, rpc:call(Server0, rabbit_stream_queue, delete_replica,
                               [<<"/">>, Q, Server1])),
     %% Delete the last replica
     ?assertEqual(ok, rpc:call(Server0, rabbit_stream_queue, delete_replica,
                               [<<"/">>, Q, Server2])),
-    check_leader_and_replicas(Config, Q, Server0, []).
+    timer:sleep(2000),
+    check_leader_and_replicas(Config, Q, [Server0]).
 
 grow_coordinator_cluster(Config) ->
     [Server0, Server1, _Server2] =
@@ -437,13 +443,13 @@ delete_down_replica(Config) ->
     Q = ?config(queue_name, Config),
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
-    check_leader_and_replicas(Config, Q, Server0, [Server1, Server2]),
+    check_leader_and_replicas(Config, Q, [Server0, Server1, Server2]),
     ok = rabbit_ct_broker_helpers:stop_node(Config, Server1),
     ?assertEqual({error, node_not_running},
                  rpc:call(Server0, rabbit_stream_queue, delete_replica,
                           [<<"/">>, Q, Server1])),
     %% check it isn't gone
-    check_leader_and_replicas(Config, Q, Server0, [Server1, Server2]),
+    check_leader_and_replicas(Config, Q, [Server0, Server1, Server2]),
     ok = rabbit_ct_broker_helpers:start_node(Config, Server1),
     timer:sleep(5000),
     ?assertEqual(ok,
@@ -509,7 +515,8 @@ recover(Config) ->
     quorum_queue_utils:wait_for_messages(Config, [[Q, <<"1">>, <<"1">>, <<"0">>]]),
     Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server),
     publish(Ch1, Q),
-    quorum_queue_utils:wait_for_messages(Config, [[Q, <<"2">>, <<"2">>, <<"0">>]]).
+    quorum_queue_utils:wait_for_messages(Config, [[Q, <<"2">>, <<"2">>, <<"0">>]]),
+    ok.
 
 consume_without_qos(Config) ->
     [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
@@ -518,7 +525,7 @@ consume_without_qos(Config) ->
     Q = ?config(queue_name, Config),
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
-    
+
     ?assertExit({{shutdown, {server_initiated_close, 406, _}}, _},
                 amqp_channel:subscribe(Ch, #'basic.consume'{queue = Q, consumer_tag = <<"ctag">>},
                                        self())).
@@ -1180,7 +1187,7 @@ leader_failover(Config) ->
     [publish(Ch1, Q, <<"msg">>) || _ <- lists:seq(1, 100)],
     amqp_channel:wait_for_confirms(Ch1, 5),
 
-    check_leader_and_replicas(Config, Q, Server1, [Server2, Server3]),
+    check_leader_and_replicas(Config, Q, [Server1, Server2, Server3]),
 
     ok = rabbit_ct_broker_helpers:stop_node(Config, Server1),
     timer:sleep(30000),
@@ -1206,7 +1213,7 @@ leader_failover_dedupe(Config) ->
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Ch1, Q, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
 
-    check_leader_and_replicas(Config, Q, DownNode, lists:delete(DownNode, Nodes)),
+    check_leader_and_replicas(Config, Q, Nodes),
 
     Ch2 = rabbit_ct_client_helpers:open_channel(Config, PubNode),
     #'confirm.select_ok'{} = amqp_channel:call(Ch2, #'confirm.select'{}),
@@ -1279,7 +1286,7 @@ initial_cluster_size_one(Config) ->
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                   {<<"x-initial-cluster-size">>, long, 1}])),
-    check_leader_and_replicas(Config, Q, Server1, []),
+    check_leader_and_replicas(Config, Q, [Server1]),
 
     ?assertMatch(#'queue.delete_ok'{},
                  amqp_channel:call(Ch, #'queue.delete'{queue = Q})).
@@ -1301,7 +1308,7 @@ initial_cluster_size_two(Config) ->
                rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
                                             info_all, [<<"/">>, [name, leader, members]])),
     ?assertEqual(Server1, proplists:get_value(leader, Info)),
-    ?assertEqual(1, length(proplists:get_value(members, Info))),
+    ?assertEqual(2, length(proplists:get_value(members, Info))),
 
     ?assertMatch(#'queue.delete_ok'{},
                  amqp_channel:call(Ch, #'queue.delete'{queue = Q})).
@@ -1319,7 +1326,7 @@ initial_cluster_size_one_policy(Config) ->
     ?assertEqual({'queue.declare_ok', Q, 0, 0},
                  declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"stream">>},
                                   {<<"x-initial-cluster-size">>, long, 1}])),
-    check_leader_and_replicas(Config, Q, Server1, []),
+    check_leader_and_replicas(Config, Q, [Server1]),
 
     ?assertMatch(#'queue.delete_ok'{},
                  amqp_channel:call(Ch, #'queue.delete'{queue = Q})),
@@ -1637,17 +1644,18 @@ get_queue_type(Server, Q0) ->
     {ok, Q1} = rpc:call(Server, rabbit_amqqueue, lookup, [QNameRes]),
     amqqueue:get_type(Q1).
 
-check_leader_and_replicas(Config, Name, Leader, Replicas0) -> 
+check_leader_and_replicas(Config, Name, Members) ->
     QNameRes = rabbit_misc:r(<<"/">>, queue, Name),
     [Info] = lists:filter(
                fun(Props) ->
                        lists:member({name, QNameRes}, Props)
                end,
                rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue,
-                                            info_all, [<<"/">>, [name, leader, members]])),
-    ?assertEqual(Leader, proplists:get_value(leader, Info)),
-    Replicas = lists:sort(Replicas0),
-    ?assertEqual(Replicas, lists:sort(proplists:get_value(members, Info))).
+                                            info_all, [<<"/">>, [name, leader,
+                                                                 members]])),
+    ct:pal("~s members ~w ~p", [?FUNCTION_NAME, Members, Info]),
+    ?assert(lists:member(proplists:get_value(leader, Info), Members)),
+    ?assertEqual(lists:sort(Members), lists:sort(proplists:get_value(members, Info))).
 
 publish(Ch, Queue) ->
     publish(Ch, Queue, <<"msg">>).
