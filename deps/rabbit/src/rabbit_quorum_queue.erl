@@ -406,7 +406,14 @@ handle_tick(QName,
                                {messages_persistent, M}
 
                                | infos(QName, ?STATISTICS_KEYS -- [consumers])],
-                      rabbit_core_metrics:queue_stats(QName, Infos),
+                      {ok, Queue} = rabbit_amqqueue:lookup(QName),
+                      Up = case ra:consistent_query(amqqueue:get_pid(Queue), fun (_) -> ok end) of
+                          {ok, ok, _} -> 1;
+                          _ ->
+                              rabbit_log:debug("ra:consistent_query failed for queue ~p~n", [QName]),
+                              0
+                      end,
+                      rabbit_core_metrics:queue_stats(QName, [{up, Up} | Infos]),
                       rabbit_event:notify(queue_stats,
                                           Infos ++ [{name, QName},
                                                     {messages, M},

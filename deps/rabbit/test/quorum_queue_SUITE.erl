@@ -128,6 +128,7 @@ all_tests() ->
      queue_length_in_memory_purge,
      in_memory,
      consumer_metrics,
+     up_metrics,
      invalid_policy,
      delete_if_empty,
      delete_if_unused,
@@ -2524,6 +2525,23 @@ consumer_metrics(Config) ->
     [{_, PropList, _}] = rpc:call(Leader, ets, lookup, [queue_metrics, QNameRes]),
     ?assertMatch([{consumers, 1}], lists:filter(fun({Key, _}) ->
                                                         Key == consumers
+                                                end, PropList)).
+
+up_metrics(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch1, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
+
+    RaName = ra_name(QQ),
+    {ok, _, {_, Leader}} = ra:members({RaName, Server}),
+    timer:sleep(5000),
+    QNameRes = rabbit_misc:r(<<"/">>, queue, QQ),
+    [{_, PropList, _}] = rpc:call(Leader, ets, lookup, [queue_metrics, QNameRes]),
+    ?assertMatch([{up, 1}], lists:filter(fun({Key, _}) ->
+                                                        Key == up
                                                 end, PropList)).
 
 delete_if_empty(Config) ->
