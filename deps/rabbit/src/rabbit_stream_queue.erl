@@ -105,8 +105,9 @@ create_stream(Q0, Node) ->
     Opts = amqqueue:get_options(Q0),
     ActingUser = maps:get(user, Opts, ?UNKNOWN_USER),
     Conf0 = make_stream_conf(Node, Q0),
-    LeaderNode = Node, %% TODO run leader selection
-    Q1 = amqqueue:set_type_state(Q0, Conf0),
+    Conf = apply_leader_locator_strategy(Conf0),
+    #{leader_node := LeaderNode} = Conf,
+    Q1 = amqqueue:set_type_state(Q0, Conf),
     case rabbit_amqqueue:internal_declare(Q1, false) of
         {created, Q} ->
             case rabbit_stream_coordinator:new_stream(Q, LeaderNode) of
@@ -803,4 +804,50 @@ set_leader_pid(Pid, QName) ->
             rabbit_amqqueue:ensure_rabbit_queue_record_is_initialized(Fun(Q));
         _ ->
             ok
+    end.
+
+apply_leader_locator_strategy(#{leader_locator_strategy := <<"client-local">>} = Conf) ->
+    Conf;
+apply_leader_locator_strategy(#{leader_node := Leader,
+                                replica_nodes := Replicas0,
+                                leader_locator_strategy := <<"random">>,
+                                name := StreamId} = Conf) ->
+    Replicas = [Leader | Replicas0],
+    ClusterSize = length(Replicas),
+    Hash = erlang:phash2(StreamId),
+    Pos = (Hash rem ClusterSize) + 1,
+    NewLeader = lists:nth(Pos, Replicas),
+    NewReplicas = lists:delete(NewLeader, Replicas),
+    Conf#{leader_node => NewLeader,
+          replica_nodes => NewReplicas};
+apply_leader_locator_strategy(#{leader_node := Leader,
+                                replica_nodes := Replicas0,
+                                leader_locator_strategy := <<"least-leaders">>} = Conf) ->
+    Replicas = [Leader | Replicas0],
+    Counters0 = maps:from_list([{R, 0} || R <- Replicas]),
+    Counters = maps:to_list(
+                 lists:foldl(fun(Q, Acc) ->
+                                     P = amqqueue:get_pid(Q),
+                                     case amqqueue:get_type(Q) of
+                                         ?MODULE when is_pid(P) ->
+                                             maps:update_with(node(P), fun(V) -> V + 1 end, 1, Acc);
+                                         _ ->
+                                             Acc
+                                     end
+                             end, Counters0, rabbit_amqqueue:list())),
+    Ordered = lists:sort(fun({_, V1}, {_, V2}) ->
+                                 V1 =< V2
+                         end, Counters),
+    %% We could have potentially introduced nodes that are not in the list of replicas if
+    %% initial cluster size is smaller than the cluster size. Let's select the first one
+    %% that is on the list of replicas
+    NewLeader = select_first_matching_node(Ordered, Replicas),
+    NewReplicas = lists:delete(NewLeader, Replicas),
+    Conf#{leader_node => NewLeader,
+          replica_nodes => NewReplicas}.
+
+select_first_matching_node([{N, _} | Rest], Replicas) ->
+    case lists:member(N, Replicas) of
+        true -> N;
+        false -> select_first_matching_node(Rest, Replicas)
     end.

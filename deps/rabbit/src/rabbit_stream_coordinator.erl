@@ -42,6 +42,7 @@
 
 
 -export([log_overview/1]).
+-export([replay/1]).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include("amqqueue.hrl").
@@ -61,19 +62,23 @@
 
 -record(member,
         {state = {down, 0} :: {down, osiris:epoch()}
-         | {stopped, osiris:epoch(), tail()}
-         | {ready, osiris:epoch()}
-         %% when a replica disconnects
-         | {running | disconnected, osiris:epoch(), pid()}
-         | deleted,
+                              | {stopped, osiris:epoch(), tail()}
+                              | {ready, osiris:epoch()}
+                              %% when a replica disconnects
+                              | {running | disconnected, osiris:epoch(), pid()}
+                              | deleted,
          role :: {writer | replica, osiris:epoch()},
          node :: node(),
          %% the currently running action, if any
-         current :: undefined
-         | stopping
-         | starting
-         | deleting,
-         current_ts :: integer(),
+         current :: undefined |
+                    {updating |
+                     stopping |
+                     starting |
+                     deleting, ra:index()} |
+                    {sleeping, nodeup | non_neg_integer()},
+         % current_ts :: integer(),
+         %% record the "current" config used
+         conf :: undefined | osiris:config(),
          target = running :: running | stopped | deleted}).
 
 %% member lifecycle
@@ -216,9 +221,7 @@ delete_replica(StreamId, Node) ->
 
 policy_changed(Q) when ?is_amqqueue(Q) ->
     StreamId = maps:get(name, amqqueue:get_type_state(Q)),
-    process_command({policy_changed, #{stream_id => StreamId,
-                                       queue => Q,
-                                       retries => 1}}).
+    process_command({policy_changed, StreamId, #{queue => Q}}).
 
 local_pid(StreamId) when is_list(StreamId) ->
     MFA = {?MODULE, query_local_pid, [StreamId, node()]},
@@ -238,6 +241,10 @@ query_local_pid(StreamId, Node, #?MODULE{streams = Streams}) ->
                                                 {running, _, Pid}}}}} ->
             {ok, Pid};
         _ ->
+            rabbit_log:debug("NOT FOUND ~w ~p",
+                             [StreamId,
+                              Streams]),
+
             {error, not_found}
     end.
 
@@ -318,10 +325,12 @@ init(_Conf) ->
 
 -spec apply(map(), command(), state()) ->
     {state(), term(), ra_machine:effects()}.
-apply(Meta, {_CmdTag, StreamId, #{}} = Cmd,
+apply(#{index := _Idx} = Meta0, {_CmdTag, StreamId, #{}} = Cmd,
       #?MODULE{streams = Streams0,
                monitors = Monitors0} = State0) ->
+    % rabbit_log:debug("~s: term ~b cmd ~w", [?MODULE, Term, Cmd]),
     Stream0 = maps:get(StreamId, Streams0, undefined),
+    Meta = maps:without([term, machine_version], Meta0),
     Stream1 = update_stream(Meta, Cmd, Stream0),
     Reply = case Stream1 of
                 #stream{reply_to = undefined} ->
@@ -335,142 +344,28 @@ apply(Meta, {_CmdTag, StreamId, #{}} = Cmd,
             {State0#?MODULE{streams = maps:remove(StreamId, Streams0)},
              Reply, []};
         _ ->
-            {Stream2, Effects0} = evaluate_stream(Stream1, []),
-            {Stream, Effects1} = eval_listeners(Stream2, Effects0),
-            {Monitors, Effects} = ensure_monitors(Stream, Monitors0, Effects1),
+            {Stream2, Effects0} = evaluate_stream(Meta, Stream1, []),
+            {Stream3, Effects1} = eval_listeners(Stream2, Effects0),
+            {Stream, Effects2} = eval_retention(Meta, Stream3, Effects1),
+            {Monitors, Effects} = ensure_monitors(Stream, Monitors0, Effects2),
             {State0#?MODULE{streams = Streams0#{StreamId => Stream},
                             monitors = Monitors}, Reply, Effects}
     end;
-% apply(Meta, {policy_changed, #{stream_id := StreamId,
-%                                queue := Q,
-%                                retries := Retries}} = Cmd,
-%       #?MODULE{streams = Streams0} = State) ->
-%     From = maps:get(from, Meta, undefined),
-%     case maps:get(StreamId, Streams0, undefined) of
-%         undefined ->
-%             {State, ok, []};
-%         #{conf := Conf,
-%           state := running} = SState0 ->
-%             case rabbit_stream_queue:update_stream_conf(Q, Conf) of
-%                 Conf ->
-%                     %% No changes, ensure we only trigger an election if it's a must
-%                     {State, ok, []};
-%                 #{retention := Retention,
-%                   leader_pid := Pid,
-%                   replica_pids := Pids} = Conf0 ->
-%                     case maps:remove(retention, Conf) == maps:remove(retention, Conf0) of
-%                         true ->
-%                             %% Only retention policy has changed, it doesn't need a full restart
-%                             Phase = phase_update_retention,
-%                             %% TODO do it over replicas too
-%                             PhaseArgs = [[Pid | Pids], Retention, Conf0, Retries],
-%                             SState = update_stream_state(From, update_retention, Phase, PhaseArgs, SState0),
-%                             rabbit_log:debug("rabbit_stream_coordinator: ~w entering ~p on node ~p",
-%                                              [StreamId, Phase, node()]),
-%                             {State#?MODULE{streams = Streams0#{StreamId => SState}}, '$ra_no_reply',
-%                              [{aux, {phase, StreamId, Phase, PhaseArgs}}]};
-%                         false ->
-%                             {State, ok, [{mod_call, osiris_writer, stop, [Conf]}]}
-%                     end
-%             end;
-%         SState0 ->
-%             Streams = maps:put(StreamId, add_pending_cmd(From, Cmd, SState0), Streams0),
-%             {State#?MODULE{streams = Streams}, '$ra_no_reply', []}
-
-%     end;
-% apply(#{from := From}, {start_cluster, #{queue := Q}}, #?MODULE{streams = Streams} = State) ->
-%     #{name := StreamId} = Conf0 = amqqueue:get_type_state(Q),
-%     Conf = apply_leader_locator_strategy(Conf0, Streams),
-%     case maps:is_key(StreamId, Streams) of
-%         true ->
-%             {State, '$ra_no_reply', wrap_reply(From, {error, already_started})};
-%         false ->
-%             Phase = phase_start_cluster,
-%             PhaseArgs = [amqqueue:set_type_state(Q, Conf)],
-%             SState = #{state => start_cluster,
-%                        phase => Phase,
-%                        phase_args => PhaseArgs,
-%                        conf => Conf,
-%                        reply_to => From,
-%                        pending_cmds => [],
-%                        pending_replicas => []},
-%             rabbit_log:debug("rabbit_stream_coordinator: ~s entering phase_start_cluster", [StreamId]),
-%             {State#?MODULE{streams = maps:put(StreamId, SState, Streams)},
-%              '$ra_no_reply',
-%              [{aux, {phase, StreamId, Phase, PhaseArgs}}]}
-%     end;
-% apply(_Meta, {start_cluster_reply, Q}, #?MODULE{streams = Streams,
-%                                                 monitors = Monitors0} = State) ->
-%     #{name := StreamId,
-%       leader_pid := LeaderPid,
-%       replica_pids := ReplicaPids} = Conf = amqqueue:get_type_state(Q),
-%     %% TODO: this doesn't guarantee that all replicas were started successfully
-%     %% we need to do something to check if any were not started and start a
-%     %% retry phase to get them running
-%     SState0 = maps:get(StreamId, Streams),
-%     Phase = phase_repair_mnesia,
-%     PhaseArgs = [new, Q],
-%     SState = SState0#{conf => Conf,
-%                       phase => Phase,
-%                       phase_args => PhaseArgs},
-%     Monitors = lists:foldl(fun(Pid, M) ->
-%                                    maps:put(Pid, {StreamId, follower}, M)
-%                            end, maps:put(LeaderPid, {StreamId, leader}, Monitors0), ReplicaPids),
-%     MonitorActions = [{monitor, process, Pid} || Pid <- ReplicaPids ++ [LeaderPid]],
-%     rabbit_log:debug("rabbit_stream_coordinator: ~s entering ~w "
-%                      "after start_cluster_reply", [StreamId, Phase]),
-%     {State#?MODULE{streams = maps:put(StreamId, SState, Streams),
-%                    monitors = Monitors}, ok,
-%      MonitorActions ++ [{aux, {phase, StreamId, Phase, PhaseArgs}}]};
-% apply(_Meta, {start_replica_failed, #{stream_id := StreamId,
-%                                       node := Node,
-%                                       retries := Retries}, Reply},
-%       #?MODULE{streams = Streams0} = State) ->
-%     case maps:get(StreamId, Streams0, undefined) of
-%         undefined ->
-%             {State, {error, not_found}, []};
-%         #{pending_replicas := Pending,
-%           reply_to := From} = SState ->
-%             rabbit_log:debug("rabbit_stream_coordinator: ~s start replica on node ~w failed",
-%                              [StreamId, Node]),
-%             rabbit_log:debug("PENDING ~p", [Pending]),
-%             case lists:member(Node, Pending) of
-%                 true ->
-%                     Streams = Streams0#{StreamId => clear_stream_state(SState#{pending_replicas =>
-%                                                                                add_unique(Node, Pending)})},
-%                     reply_and_run_pending(
-%                       From, StreamId, ok, Reply,
-%                       [{timer, {pipeline,
-%                                 [{start_replica, #{stream_id => StreamId,
-%                                                    node => Node,
-%                                                    retries => Retries + 1}}]},
-%                         ?RESTART_TIMEOUT * Retries}],
-%                       State#?MODULE{streams = Streams});
-%                 false ->
-%                     {State, ok, []}
-%             end
-%     end;
-% apply(_Meta, {update_retention_failed, StreamId, Q, Retries, Reply},
-%       #?MODULE{streams = Streams0} = State) ->
-%     rabbit_log:debug("rabbit_stream_coordinator: ~w update retention failed", [StreamId]),
-%     case maps:get(StreamId, Streams0, undefined) of
-%         undefined ->
-%             {State, {error, not_found}, []};
-%         #{reply_to := From} = SState  ->
-%             Streams = Streams0#{StreamId => clear_stream_state(SState)},
-%             reply_and_run_pending(
-%               From, StreamId, ok, Reply,
-%               [{timer, {pipeline,
-%                         [{policy_changed, #{stream_id => StreamId,
-%                                             queue => Q,
-%                                             retries => Retries + 1}}]},
-%                 ?RESTART_TIMEOUT * Retries}],
-%               State#?MODULE{streams = Streams})
-%     end;
-apply(Meta, {down, Pid, _Reason} = Cmd,
+apply(Meta, {down, Pid, Reason} = Cmd,
       #?MODULE{streams = Streams0,
                listeners = Listeners0,
                monitors = Monitors0} = State) ->
+
+    rabbit_log:debug("rabbit_stream_coordinator: down ~W",
+                     [Cmd, 10]),
+    Effects0 = case Reason of
+                   noconnection ->
+                       [{monitor, node, node(Pid)}];
+                   shutdown ->
+                       [{monitor, node, node(Pid)}];
+                   _ ->
+                       []
+               end,
     case maps:take(Pid, Monitors0) of
         {{StreamId, listener}, Monitors} ->
             Listeners = case maps:take(StreamId, Listeners0) of
@@ -485,16 +380,23 @@ apply(Meta, {down, Pid, _Reason} = Cmd,
                                 end
                         end,
             {State#?MODULE{listeners = Listeners,
-                           monitors = Monitors}, ok, []};
-        {{StreamId, member}, Monitors} ->
-            Stream0 = maps:get(StreamId, Streams0, undefined),
-            Stream1 = update_stream(Meta, Cmd, Stream0),
-            {Stream, Effects} = evaluate_stream(Stream1, []),
-            Streams = Streams0#{StreamId => Stream},
-            {State#?MODULE{streams = Streams,
-                           monitors = Monitors}, ok, Effects};
+                           monitors = Monitors}, ok, Effects0};
+        {{StreamId, member}, Monitors1} ->
+            case Streams0 of
+                #{StreamId := Stream0} ->
+                    Stream1 = update_stream(Meta, Cmd, Stream0),
+                    {Stream, Effects} = evaluate_stream(Meta, Stream1, Effects0),
+                    Streams = Streams0#{StreamId => Stream},
+                    {State#?MODULE{streams = Streams,
+                                   monitors = Monitors1}, ok, Effects};
+                _ ->
+                    %% stream not found, can happen if "late" downs are
+                    %% received
+                    {State#?MODULE{streams = Streams0,
+                                   monitors = Monitors1}, ok, Effects0}
+            end;
         error ->
-            {State, ok, []}
+            {State, ok, Effects0}
     end;
 apply(_, {timeout, {aux, Cmd}}, State) ->
     {State, ok, [{aux, Cmd}]};
@@ -513,31 +415,47 @@ apply(_Meta, {register_listener, #{pid := Pid,
         _ ->
             {State0, stream_not_found, []}
     end;
+apply(Meta, {nodeup, Node} = Cmd,
+      #?MODULE{monitors = Monitors0,
+               streams = Streams0} = State)  ->
+    %% reissue monitors for all disconnected members
+    {Effects0, Monitors} =
+        maps:fold(
+          fun(_, #stream{id = Id,
+                         members = M}, {Acc, Mon}) ->
+                  case M of
+                      #{Node := #member{state = {disconnected, _, P}}} ->
+                          {[{monitor, process, P} | Acc],
+                           Mon#{P => {Id, member}}};
+                      _ ->
+                          {Acc, Mon}
+                  end
+          end, {[], Monitors0}, Streams0),
+    {Streams, Effects} =
+        maps:fold(fun (Id, S0, {Ss, E0}) ->
+                          S1 = update_stream(Meta, Cmd, S0),
+                          {S, E} = evaluate_stream(Meta, S1, E0),
+                          {Ss#{Id => S}, E}
+                  end, {Streams0, Effects0}, Streams0),
+    {State#?MODULE{monitors = Monitors,
+                   streams = Streams}, ok, Effects};
 apply(_Meta, UnkCmd, State) ->
+
     rabbit_log:debug("rabbit_stream_coordinator: unknown command ~W",
                      [UnkCmd, 10]),
     {State, {error, unknown_command}, []}.
 
-% state_enter(leader, #?MODULE{streams = Streams, monitors = Monitors}) ->
-%     maps:fold(fun(_, #{conf := #{name := StreamId},
-%                        pending_replicas := Pending,
-%                        state := State,
-%                        phase := Phase,
-%                        phase_args := PhaseArgs}, Acc) ->
-%                       restart_aux_phase(State, Phase, PhaseArgs, StreamId) ++
-%                           pipeline_restart_replica_cmds(StreamId, Pending) ++
-%                           Acc
-%               end, [{monitor, process, P} || P <- maps:keys(Monitors)], Streams);
-% state_enter(follower, #?MODULE{monitors = Monitors}) ->
-%     [{monitor, process, P} || P <- maps:keys(Monitors)];
-% state_enter(recover, _) ->
-%     put('$rabbit_vm_category', ?MODULE),
-%     [];
-state_enter(leader, #?MODULE{streams = _Streams, monitors = Monitors}) ->
-    rabbit_log:debug("coordinator state enter leader mons: ~p~n~p",
-                     [Monitors, _Streams]),
-    [{aux, fail_active_actions} |
-     [{monitor, process, P} || P <- maps:keys(Monitors)]];
+state_enter(recover, _) ->
+    put('$rabbit_vm_category', ?MODULE),
+    [];
+state_enter(leader, #?MODULE{monitors = Monitors}) ->
+    rabbit_log:debug("~s: state enter leader mons: ~p",
+                     [?MODULE, Monitors]),
+    Pids = maps:keys(Monitors),
+    Nodes = maps:from_list([{node(P), ok} || P <- Pids]),
+    NodeMons = [{monitor, node, N} || N <- maps:keys(Nodes)],
+    NodeMons ++ [{aux, fail_active_actions} |
+                 [{monitor, process, P} || P <- Pids]];
 state_enter(S, _) ->
     rabbit_log:debug("coordinator state enter: ~s", [S]),
     %% TODO: need to reset all running tasks, this will need to be a special
@@ -549,6 +467,7 @@ tick(_Ts, _State) ->
 
 maybe_resize_coordinator_cluster() ->
     spawn(fun() ->
+                  rabbit_log:info("resizing coordinator cluster", []),
                   case ra:members({?MODULE, node()}) of
                       {_, Members, _} ->
                           MemberNodes = [Node || {_, Node} <- Members],
@@ -604,7 +523,10 @@ remove_members(Members, [Node | Nodes]) ->
     end.
 
 -record(aux, {actions = #{} ::
-              #{pid() := {stream_id(), node(), osiris:epoch()}}}).
+              #{pid() := {stream_id(), #{node := node(),
+                                         index := non_neg_integer(),
+                                          epoch := osiris:epoch()}}},
+              resizer :: undefined | pid()}).
 
 init_aux(_Name) ->
     #aux{}.
@@ -612,58 +534,67 @@ init_aux(_Name) ->
 
 %% TODO ensure the dead writer is restarted as a replica at some point in time, increasing timeout?
 handle_aux(leader, _, maybe_resize_coordinator_cluster,
-           {Monitors, undefined}, LogState, _) ->
+           #aux{resizer = undefined} = Aux, LogState, _) ->
     Pid = maybe_resize_coordinator_cluster(),
-    {no_reply, {Monitors, Pid}, LogState, [{monitor, process, aux, Pid}]};
+    {no_reply, Aux#aux{resizer = Pid}, LogState, [{monitor, process, aux, Pid}]};
 handle_aux(leader, _, maybe_resize_coordinator_cluster,
            AuxState, LogState, _) ->
     %% Coordinator resizing is still happening, let's ignore this tick event
     {no_reply, AuxState, LogState};
 handle_aux(leader, _, {down, Pid, _},
-           {Monitors, Pid}, LogState, _) ->
+           #aux{resizer = Pid} = Aux, LogState, _) ->
     %% Coordinator resizing has finished
-    {no_reply, {Monitors, undefined}, LogState};
-handle_aux(leader, _, {phase, _, Fun, Args} = Cmd,
-           {Monitors, Coordinator}, LogState, _) ->
-    Pid = erlang:apply(?MODULE, Fun, Args),
-    Actions = [{monitor, process, aux, Pid}],
-    {no_reply, {maps:put(Pid, Cmd, Monitors), Coordinator}, LogState, Actions};
-handle_aux(leader, _, {start_writer, StreamId, #{leader_node := Node} = Conf},
+    {no_reply, Aux#aux{resizer = undefined}, LogState};
+handle_aux(leader, _, {start_writer, StreamId,
+                       #{epoch := Epoch, node := Node} = Args, Conf},
            Aux, LogState, _) ->
-    rabbit_log:debug("rabbit_stream_coordinator: running action: 'start_writer'"
-                     " for ~s on node ~w", [StreamId, Node]),
-    ActionFun = fun () -> phase_start_writer(Conf) end,
-    run_action(starting, Node, Conf, ActionFun, Aux, LogState);
-handle_aux(leader, _, {start_replica, StreamId, Node, #{epoch := Epoch} = Conf},
+    rabbit_log:debug("~s: running action: 'start_writer'"
+                     " for ~s on node ~w in epoch ~b",
+                     [?MODULE, StreamId, Node, Epoch]),
+    ActionFun = fun () -> phase_start_writer(StreamId, Args, Conf) end,
+    run_action(starting, StreamId, Args, ActionFun, Aux, LogState);
+handle_aux(leader, _, {start_replica, StreamId,
+                       #{epoch := Epoch, node := Node} = Args, Conf},
            Aux, LogState, _) ->
     rabbit_log:debug("rabbit_stream_coordinator: running action: 'start_replica'"
                      " for ~s on node ~w in epoch ~b", [StreamId, Node, Epoch]),
-    ActionFun = fun () -> phase_start_replica(Node, Conf) end,
-    run_action(starting, Node, Conf, ActionFun, Aux, LogState);
-handle_aux(leader, _, {stop, StreamId, Node, Epoch, Conf},
+    ActionFun = fun () -> phase_start_replica(StreamId, Args, Conf) end,
+    run_action(starting, StreamId, Args, ActionFun, Aux, LogState);
+handle_aux(leader, _, {stop, StreamId, #{node := Node,
+                                         epoch := Epoch} = Args, Conf},
            Aux, LogState, _) ->
     rabbit_log:debug("rabbit_stream_coordinator: running action: 'stop'"
                      " for ~s on node ~w in epoch ~b", [StreamId, Node, Epoch]),
-    ActionFun = fun () -> phase_stop_member(Node, Epoch, Conf) end,
-    run_action(stopping, Node, Conf, ActionFun, Aux, LogState);
-handle_aux(leader, _, {update_mnesia, StreamId, Conf},
+    ActionFun = fun () -> phase_stop_member(StreamId, Args, Conf) end,
+    run_action(stopping, StreamId, Args, ActionFun, Aux, LogState);
+handle_aux(leader, _, {update_mnesia, StreamId, Args, Conf},
            #aux{actions = _Monitors} = Aux, LogState,
            #?MODULE{streams = _Streams}) ->
     rabbit_log:debug("rabbit_stream_coordinator: running action: 'update_mnesia'"
                      " for ~s", [StreamId]),
-    ActionFun = fun () -> phase_update_mnesia(Conf) end,
-    run_action(updating_mnesia, node(), Conf, ActionFun, Aux, LogState);
-handle_aux(leader, _, {delete_member, StreamId, Node, Conf},
+    ActionFun = fun () -> phase_update_mnesia(StreamId, Args, Conf) end,
+    run_action(updating_mnesia, StreamId, Args, ActionFun, Aux, LogState);
+handle_aux(leader, _, {update_retention, StreamId, Args, _Conf},
+           #aux{actions = _Monitors} = Aux, LogState,
+           #?MODULE{streams = _Streams}) ->
+    rabbit_log:debug("rabbit_stream_coordinator: running action: 'update_mnesia'"
+                     " for ~s", [StreamId]),
+    ActionFun = fun () -> phase_update_retention(StreamId, Args) end,
+    run_action(update_retention, StreamId, Args, ActionFun, Aux, LogState);
+handle_aux(leader, _, {delete_member, StreamId, #{node := Node} = Args, Conf},
            #aux{actions = _Monitors} = Aux, LogState,
            #?MODULE{streams = _Streams}) ->
     rabbit_log:debug("rabbit_stream_coordinator: running action: 'delete_member'"
                      " for ~s ~s", [StreamId, Node]),
-    ActionFun = fun () -> phase_delete_member(StreamId, Node, Conf) end,
-    run_action(delete_member, node(), Conf, ActionFun, Aux, LogState);
+    ActionFun = fun () -> phase_delete_member(StreamId, Args, Conf) end,
+    run_action(delete_member, StreamId, Args, ActionFun, Aux, LogState);
 handle_aux(leader, _, fail_active_actions,
            #aux{actions = Monitors} = Aux, LogState,
            #?MODULE{streams = Streams}) ->
-    Exclude = maps:from_list([{S, ok} || {S, _, _} <- maps:values(Monitors)]),
+    Exclude = maps:from_list([{S, ok}
+                              || {P, {S, _, _}} <- maps:to_list(Monitors),
+                             not is_process_alive(P)]),
+    rabbit_log:debug("~s: failing actions: ~w", [?MODULE, Exclude]),
     fail_active_actions(Streams, Exclude),
     {no_reply, Aux, LogState, []};
 handle_aux(leader, _, {down, Pid, normal},
@@ -674,14 +605,12 @@ handle_aux(leader, _, {down, Pid, Reason},
            #aux{actions = Monitors0} = Aux, LogState, _) ->
     %% An action has failed - report back to the state machine
     case maps:get(Pid, Monitors0, undefined) of
-        {StreamId, Action, Node, Epoch} ->
+        {StreamId, Action, #{node := Node, epoch := Epoch} = Args} ->
             rabbit_log:warning("Error while executing action for stream queue ~s, "
-                               " node ~s, epoch ~b Err: ~w", [StreamId, Node, Epoch, Reason]),
+                               " node ~s, epoch ~b Err: ~w",
+                               [StreamId, Node, Epoch, Reason]),
             Monitors = maps:remove(Pid, Monitors0),
-            Cmd = {action_failed, StreamId,
-                   #{action => Action,
-                     node => Node,
-                     epoch => Epoch}},
+            Cmd = {action_failed, StreamId, Args#{action => Action}},
             send_self_command(Cmd),
             {no_reply, Aux#aux{actions = maps:remove(Pid, Monitors)},
              LogState, []};
@@ -692,171 +621,154 @@ handle_aux(leader, _, {down, Pid, Reason},
 handle_aux(_, _, _, AuxState, LogState, _) ->
     {no_reply, AuxState, LogState}.
 
-run_action(Action, Node, #{epoch := E, name := StreamId},
-           ActionFun,
-           #aux{actions = Actions0} = Aux, Log) ->
+run_action(Action, StreamId, #{node := _Node,
+                               epoch := _Epoch} = Args,
+           ActionFun, #aux{actions = Actions0} = Aux, Log) ->
     Pid = spawn(ActionFun),
-    % Effects = [{monitor, process, aux, Pid}],
     Effects = [],
-    Actions = Actions0#{Pid => {StreamId, Action, Node, E}},
+    Actions = Actions0#{Pid => {StreamId, Action, Args}},
     {no_reply, Aux#aux{actions = Actions}, Log, Effects}.
-
-% reply_and_run_pending(From, StreamId, Reply, WrapReply, Actions0, #?MODULE{streams = Streams} = State) ->
-%     #{pending_cmds := Pending} = SState0 = maps:get(StreamId, Streams),
-%     AuxActions = [{mod_call, ra, pipeline_command, [{?MODULE, node()}, Cmd]}
-%                   || Cmd <- Pending],
-%     SState = maps:put(pending_cmds, [], SState0),
-%     Actions = case From of
-%                   undefined ->
-%                       AuxActions ++ Actions0;
-%                   _ ->
-%                       wrap_reply(From, WrapReply) ++ AuxActions ++ Actions0
-%               end,
-%     {State#?MODULE{streams = Streams#{StreamId => SState}}, Reply, Actions}.
 
 wrap_reply(From, Reply) ->
     [{reply, From, {wrap_reply, Reply}}].
 
-phase_start_replica(Node, #{epoch := Epoch,
-                            name := StreamId} = Conf0) ->
+phase_start_replica(StreamId, #{epoch := Epoch,
+                                node := Node} = Args, Conf0) ->
     spawn(
       fun() ->
-              try
-                  case osiris_replica:start(Node, Conf0) of
-                      {ok, Pid} ->
-                          rabbit_log:debug("~s: ~s: replica started on ~s",
-                                           [?MODULE, StreamId, Node]),
-                          send_self_command({member_started, StreamId,
-                                             #{epoch => Epoch,
-                                               pid => Pid}});
-                      {error, already_present} ->
-                          %% need to remove child record if this is the case
-                          %% can it ever happen?
-                          _ = osiris_replica:stop(Node, Conf0),
-                          send_action_failed(StreamId, starting, Node, Epoch);
-                      {error, {already_started, Pid}} ->
-                          %% TODO: we need to check that the current epoch is the same
-                          %% before we can be 100% sure it is started in the correct
-                          %% epoch, can this happen? who knows...
-                          send_self_command({member_started, StreamId,
-                                             #{epoch => Epoch,
-                                               pid => Pid}});
-                      {error, Reason} ->
-                          rabbit_log:warning("Error while starting replica for ~p : ~p",
-                                             [maps:get(name, Conf0), Reason]),
-                      send_action_failed(StreamId, starting, Node, Epoch)
-                  end
-              catch _:E->
-                      rabbit_log:warning("Error while starting replica for ~s : ~p",
-                                         [maps:get(name, Conf0), E]),
-                      send_action_failed(StreamId, starting, Node, Epoch)
+              try osiris_replica:start(Node, Conf0) of
+                  {ok, Pid} ->
+                      rabbit_log:debug("~s: ~s: replica started on ~s in ~b",
+                                       [?MODULE, StreamId, Node, Epoch]),
+                      send_self_command({member_started, StreamId,
+                                         Args#{pid => Pid}});
+                  {error, already_present} ->
+                      %% need to remove child record if this is the case
+                      %% can it ever happen?
+                      _ = osiris_replica:stop(Node, Conf0),
+                      send_action_failed(StreamId, starting, Args);
+                  {error, {already_started, Pid}} ->
+                      %% TODO: we need to check that the current epoch is the same
+                      %% before we can be 100% sure it is started in the correct
+                      %% epoch, can this happen? who knows...
+                      send_self_command({member_started, StreamId,
+                                         Args#{pid => Pid}});
+                  {error, Reason} ->
+                      rabbit_log:warning("~s: Error while starting replica for ~s : ~W",
+                                         [?MODULE, maps:get(name, Conf0), Reason, 10]),
+                      send_action_failed(StreamId, starting, Args)
+              catch _:E ->
+                        rabbit_log:warning("~s: Error while starting replica for ~s : ~p",
+                                           [?MODULE, maps:get(name, Conf0), E]),
+                        send_action_failed(StreamId, starting, Args)
               end
       end).
 
-send_action_failed(StreamId, Action, Node, Epoch) ->
-  send_self_command({action_failed, StreamId,
-                     #{action => Action,
-                       node => Node,
-                       epoch => Epoch}}).
+send_action_failed(StreamId, Action, Arg) ->
+  send_self_command({action_failed, StreamId, Arg#{action => Action}}).
 
 send_self_command(Cmd) ->
     ra:pipeline_command({?MODULE, node()}, Cmd),
     ok.
 
 
-phase_delete_member(StreamId, Node, Conf) ->
+phase_delete_member(StreamId, #{node := Node} = Arg, Conf) ->
     spawn(
       fun() ->
-              case osiris_server_sup:delete_child(Node, Conf) of
+              try osiris_server_sup:delete_child(Node, Conf) of
                   ok ->
-                      Arg = #{node => Node},
                       send_self_command({member_deleted, StreamId, Arg});
                   _ ->
-                      send_self_command({action_failed, StreamId,
-                                         #{action => deleting,
-                                           node => Node,
-                                           epoch => undefined}})
+                      send_action_failed(StreamId, deleting, Arg)
+              catch _:E ->
+                      rabbit_log:warning("~s: Error while deleting member for ~s : on node ~s ~p",
+                                         [?MODULE, StreamId, Node, E]),
+                      send_action_failed(StreamId, deleting, Arg)
               end
       end).
 
-phase_stop_member(Node, Epoch, #{name := StreamId} = Conf) ->
+phase_stop_member(StreamId, #{node := Node,
+                              epoch := Epoch} = Arg0, Conf) ->
     spawn(
       fun() ->
-              case osiris_server_sup:stop_child(Node, StreamId) of
+              try osiris_server_sup:stop_child(Node, StreamId) of
                   ok ->
-                      rabbit_log:debug("~s: ~s: member stopped on ~s in ~b",
-                                       [?MODULE, StreamId, Node, Epoch]),
                       %% get tail
-                      case get_replica_tail(Node, Conf) of
+                      try get_replica_tail(Node, Conf) of
                           {ok, Tail} ->
-                              Arg = #{node => Node,
-                                      epoch => Epoch,
-                                      tail => Tail},
+                              Arg = Arg0#{tail => Tail},
+                              rabbit_log:debug("~s: ~s: member stopped on ~s in ~b Tail ~w",
+                                               [?MODULE, StreamId, Node, Epoch, Tail]),
                               send_self_command({member_stopped, StreamId, Arg});
                           Err ->
                               rabbit_log:warning("Stream coordinator failed to get tail
                                                   of member ~s ~w Error: ~w",
                                                  [StreamId, Node, Err]),
-                              send_self_command({action_failed, StreamId,
-                                                 #{action => stopping,
-                                                   node => Node,
-                                                   epoch => Epoch}})
+                              send_action_failed(StreamId, stopping, Arg0)
+                      catch _:Err ->
+                                rabbit_log:warning("Stream coordinator failed to get
+                                                  tail of member ~s ~w Error: ~w",
+                                                   [StreamId, Node, Err]),
+                                send_action_failed(StreamId, stopping, Arg0)
+
                       end;
                   Err ->
                       rabbit_log:warning("Stream coordinator failed to stop
                                           member ~s ~w Error: ~w",
                                          [StreamId, Node, Err]),
-                      send_self_command({action_failed, StreamId,
-                                         #{action => stopping,
-                                           node => Node,
-                                           epoch => Epoch}})
+                      send_action_failed(StreamId, stopping, Arg0)
+              catch _:Err ->
+                        rabbit_log:warning("Stream coordinator failed to stop
+                                          member ~s ~w Error: ~w",
+                                           [StreamId, Node, Err]),
+                        send_action_failed(StreamId, stopping, Arg0)
               end
       end).
 
-phase_start_writer(#{name := StreamId,
-                     epoch := Epoch,
-                     leader_node := Node} = Conf) ->
+phase_start_writer(StreamId, #{epoch := Epoch,
+                               node := Node} = Args0, Conf) ->
     spawn(
       fun() ->
-              case catch osiris_writer:start(Conf) of
+              try osiris_writer:start(Conf) of
                   {ok, Pid} ->
-                      Args = #{epoch => Epoch,
-                               pid => Pid},
+                      Args = Args0#{epoch => Epoch, pid => Pid},
+                      rabbit_log:warning("~s: started writer ~s on ~w in ~b",
+                                         [?MODULE, StreamId, Node, Epoch]),
                       send_self_command({member_started, StreamId, Args});
                   Err ->
-                      rabbit_log:warning("Stream coordinator failed to start
+                      rabbit_log:warning("~s: failed to start
                                           writer ~s ~w Error: ~w",
-                                         [StreamId, Node, Err]),
-                      send_self_command({action_failed, StreamId,
-                                         #{action => starting,
-                                           node => Node,
-                                           epoch => Epoch}})
+                                         [?MODULE, StreamId, Node, Err]),
+                        send_action_failed(StreamId, starting, Args0)
+              catch _:Err ->
+                      rabbit_log:warning("~s: failed to start
+                                          writer ~s ~w Error: ~w",
+                                         [?MODULE, StreamId, Node, Err]),
+                        send_action_failed(StreamId, starting, Args0)
+
               end
       end).
 
-phase_update_retention(Pids0, Retention, #{name := StreamId}, Retries) ->
+phase_update_retention(StreamId, #{pid := Pid,
+                                   retention := Retention} = Args) ->
     spawn(
       fun() ->
-              case update_retention(Pids0, Retention) of
+              try osiris:update_retention(Pid, Retention) of
                   ok ->
-                      ra:pipeline_command({?MODULE, node()}, {phase_finished, StreamId, ok});
-                  {error, Reason} ->
-                      ra:pipeline_command({?MODULE, node()},
-                                          {update_retention_failed, StreamId,
-                                           Retention, Retries,
-                                           {error, Reason}})
+                      send_self_command({retention_updated, StreamId, Args});
+                  {error, Err} ->
+                      rabbit_log:warning("~s: failed to update
+                                          retention for ~s ~w Error: ~w",
+                                         [?MODULE, StreamId, node(Pid), Err]),
+                      send_action_failed(StreamId, update_retention, Args)
+              catch _:Err ->
+                      rabbit_log:warning("~s: failed to update
+                                          retention for ~s ~w Error: ~w",
+                                         [?MODULE, StreamId, node(Pid), Err]),
+                      send_action_failed(StreamId, update_retention, Args)
               end
       end).
 
-update_retention([], _) ->
-    ok;
-update_retention([Pid | Pids], Retention) ->
-    case osiris:update_retention(Pid, Retention) of
-        ok ->
-            update_retention(Pids, Retention);
-        {error, Reason} ->
-            {error, Reason}
-    end.
 
 get_replica_tail(Node, Conf) ->
     case rpc:call(Node, ?MODULE, log_overview, [Conf]) of
@@ -875,21 +787,28 @@ log_overview(Config) ->
     Dir = osiris_log:directory(Config),
     osiris_log:overview(Dir).
 
+
+replay(L) when is_list(L) ->
+    lists:foldl(
+      fun ({M, E}, Acc) ->
+              element(1, ?MODULE:apply(M, E, Acc))
+      end, init(#{}), L).
+
 is_quorum(1, 1) ->
     true;
 is_quorum(NumReplicas, NumAlive) ->
     NumAlive >= ((NumReplicas div 2) + 1).
 
-phase_update_mnesia(#{reference := QName,
-                      leader_pid := LeaderPid,
-                      name := StreamId} = Conf) ->
+phase_update_mnesia(StreamId, Args, #{reference := QName,
+                                       leader_pid := LeaderPid} = Conf) ->
 
-    rabbit_log:debug("sc: running mnesia update for ~s: ~w", [StreamId, Conf]),
+    rabbit_log:debug("~s: running mnesia update for ~s: ~W",
+                     [?MODULE, StreamId, Conf, 10]),
     Fun = fun (Q) ->
                   amqqueue:set_type_state(amqqueue:set_pid(Q, LeaderPid), Conf)
           end,
     spawn(fun() ->
-                  case rabbit_misc:execute_mnesia_transaction(
+                  try rabbit_misc:execute_mnesia_transaction(
                          fun() ->
                                  rabbit_amqqueue:update(QName, Fun)
                          end) of
@@ -898,9 +817,12 @@ phase_update_mnesia(#{reference := QName,
                           [Q] = mnesia:dirty_read(rabbit_durable_queue, QName),
                           rabbit_amqqueue:ensure_rabbit_queue_record_is_initialized(Fun(Q));
                       _ ->
-                          ok
-                  end,
-                  send_self_command({mnesia_updated, StreamId, Conf})
+                          send_self_command({mnesia_updated, StreamId, Conf})
+                  catch _:E ->
+                            rabbit_log:debug("~s: failed to update mnesia for ~s: ~W",
+                                             [?MODULE, StreamId, E, 10]),
+                            send_action_failed(StreamId, updating_mnesia, Args)
+                  end
           end).
 
 format_ra_event(ServerId, Evt) ->
@@ -923,47 +845,8 @@ make_ra_conf(Node, Nodes) ->
       machine => {module, ?MODULE, #{}},
       ra_event_formatter => Formatter}.
 
-apply_leader_locator_strategy(#{leader_locator_strategy := <<"client-local">>} = Conf, _) ->
-    Conf;
-apply_leader_locator_strategy(#{leader_node := Leader,
-                                replica_nodes := Replicas0,
-                                leader_locator_strategy := <<"random">>,
-                                name := StreamId} = Conf, _) ->
-    Replicas = [Leader | Replicas0],
-    ClusterSize = length(Replicas),
-    Hash = erlang:phash2(StreamId),
-    Pos = (Hash rem ClusterSize) + 1,
-    NewLeader = lists:nth(Pos, Replicas),
-    NewReplicas = lists:delete(NewLeader, Replicas),
-    Conf#{leader_node => NewLeader,
-          replica_nodes => NewReplicas};
-apply_leader_locator_strategy(#{leader_node := Leader,
-                                replica_nodes := Replicas0,
-                                leader_locator_strategy := <<"least-leaders">>} = Conf,
-                                Streams) ->
-    Replicas = [Leader | Replicas0],
-    Counters0 = maps:from_list([{R, 0} || R <- Replicas]),
-    Counters = maps:to_list(maps:fold(fun(_Key, #{conf := #{leader_node := L}}, Acc) ->
-                                              maps:update_with(L, fun(V) -> V + 1 end, 0, Acc)
-                                      end, Counters0, Streams)),
-    Ordered = lists:sort(fun({_, V1}, {_, V2}) ->
-                                 V1 =< V2
-                         end, Counters),
-    %% We could have potentially introduced nodes that are not in the list of replicas if
-    %% initial cluster size is smaller than the cluster size. Let's select the first one
-    %% that is on the list of replicas
-    NewLeader = select_first_matching_node(Ordered, Replicas),
-    NewReplicas = lists:delete(NewLeader, Replicas),
-    Conf#{leader_node => NewLeader,
-          replica_nodes => NewReplicas}.
 
-select_first_matching_node([{N, _} | Rest], Replicas) ->
-    case lists:member(N, Replicas) of
-        true -> N;
-        false -> select_first_matching_node(Rest, Replicas)
-    end.
-
-update_stream(#{system_time := Ts} = Meta,
+update_stream(#{system_time := _} = Meta,
               {new_stream, StreamId, #{leader_node := LeaderNode,
                                        queue := Q}}, undefined) ->
     #{nodes := Nodes} = Conf = amqqueue:get_type_state(Q),
@@ -979,8 +862,7 @@ update_stream(#{system_time := Ts} = Meta,
                              node = N,
                              state = {ready, E},
                              %% no members are running actions
-                             current = undefined,
-                             current_ts = Ts}
+                             current = undefined}
                  } || N <- Nodes]),
     #stream{id = StreamId,
             epoch = E,
@@ -1042,12 +924,14 @@ update_stream(#{system_time := _Ts} = _Meta,
 update_stream(#{system_time := _Ts},
               {member_started, _StreamId,
                #{epoch := E,
-                 pid := Pid}}, #stream{epoch = E,
-                                       members = Members} = Stream0) ->
+                 index := Idx,
+                 pid := Pid} = Args}, #stream{epoch = E,
+                                              members = Members} = Stream0) ->
     Node = node(Pid),
-    case maps:get(Node, Members) of
+    case maps:get(Node, Members, undefined) of
         #member{role = {_, E},
-                state = {ready, E}} = Member0 ->
+                current = {starting, Idx},
+                state = _} = Member0 ->
             %% this is what we expect, leader epoch should match overall
             %% epoch
             Member = Member0#member{state = {running, E, Pid},
@@ -1055,9 +939,11 @@ update_stream(#{system_time := _Ts},
             %% TODO: we need to tell the machine to monitor the leader
             Stream0#stream{members =
                            Members#{Node => Member}};
-        _ ->
-            %% do we just ignore any writer_started events from unexpected
+        Member ->
+            %% do we just ignore any members started events from unexpected
             %% epochs?
+            rabbit_log:warning("~s: member started unexpected ~w ~w",
+                               [?MODULE, Args, Member]),
             Stream0
     end;
 update_stream(#{system_time := _Ts},
@@ -1080,6 +966,7 @@ update_stream(#{system_time := _Ts},
 update_stream(#{system_time := _Ts},
               {member_stopped, _StreamId,
                #{node := Node,
+                 index := Idx,
                  epoch := StoppedEpoch,
                  tail := Tail}}, #stream{epoch = Epoch,
                                          target = Target,
@@ -1100,6 +987,7 @@ update_stream(#{system_time := _Ts},
 
     case maps:get(Node, Members0) of
         #member{role = {replica, Epoch},
+                current = {stopping, Idx},
                 state = _} = Member0
           when IsLeaderInCurrent ->
             %% A leader has already been selected so skip straight to ready state
@@ -1109,6 +997,7 @@ update_stream(#{system_time := _Ts},
             Members1 = Members0#{Node => Member},
             Stream0#stream{members = Members1};
         #member{role = {_, Epoch},
+                current = {stopping, Idx},
                 state = _} = Member0 ->
             %% this is what we expect, member epoch should match overall
             %% epoch
@@ -1157,7 +1046,9 @@ update_stream(#{system_time := _Ts},
                                    members = Members};
                 false ->
                     Stream0#stream{members = Members1}
-            end
+            end;
+        _Member ->
+            Stream0
     end;
 update_stream(#{system_time := _Ts},
               {mnesia_updated, _StreamId, #{epoch := E}},
@@ -1170,22 +1061,36 @@ update_stream(#{system_time := _Ts},
             Stream0#stream{mnesia = {updated, E}}
     end;
 update_stream(#{system_time := _Ts},
+              {retention_updated, _StreamId, #{node := Node}},
+              #stream{members = Members0,
+                      conf = Conf} = Stream0) ->
+    Members = maps:update_with(Node, fun (M) ->
+                                             M#member{current = undefined,
+                                                      conf = Conf}
+                                     end, Members0),
+    Stream0#stream{members = Members};
+update_stream(#{system_time := _Ts},
               {action_failed, _StreamId, #{action := updating_mnesia}},
-              #stream{members = _Members0,
-                      mnesia = {_, E}} = Stream0) ->
-    %% reset mnesia state
+              #stream{mnesia = {_, E}} = Stream0) ->
     Stream0#stream{mnesia = {updated, E}};
 update_stream(#{system_time := _Ts},
               {action_failed, _StreamId,
                #{node := Node,
+                 index := Idx,
+                 action := Action,
                  epoch := _Epoch}}, #stream{members = Members0} = Stream0) ->
-    Members1 = maps:update_with(Node, fun (M) ->
-                                              M#member{current = undefined}
-                                      end, Members0),
+    Members1 = maps:update_with(Node,
+                                fun (#member{current = {C, I}} = M)
+                                      when C == Action andalso I == Idx ->
+                                        M#member{current = undefined};
+                                    (M) ->
+                                        M
+                                end, Members0),
     case Members0 of
         #{Node := #member{role = {writer, E},
                           state = {ready, E},
-                          current = starting}} ->
+                          current = {starting, Idx}}}
+          when Action == starting ->
             %% the leader failed to start = we need a new election
             %% stop all members
             Members = maps:map(fun (_K, M) ->
@@ -1196,27 +1101,60 @@ update_stream(#{system_time := _Ts},
             Stream0#stream{members = Members1}
     end;
 update_stream(#{system_time := _Ts},
-              {down, Pid, _Reason},
+              {down, Pid, Reason},
               #stream{epoch = E,
                       members = Members0} = Stream0) ->
-
     DownNode = node(Pid),
     case Members0 of
         #{DownNode := #member{role = {writer, E},
                               state = {running, E, Pid}} = Member} ->
             Members1 = Members0#{DownNode => Member#member{state = {down, E}}},
             %% leader is down, set all members to stop
-            Members = maps:map(fun (_, M) -> M#member{target = stopped} end,
-                               Members1),
+            Members = maps:map(fun (_, M) ->
+                                       M#member{target = stopped}
+                               end, Members1),
             Stream0#stream{members = Members};
-        #{DownNode := #member{state = {running, _, Pid}} = Member} ->
+        #{DownNode := #member{role = {replica, _},
+                              state = {running, _, Pid}} = Member}
+          when Reason == noconnection orelse
+               Reason == shutdown ->
+            %% mark process as disconnected such that we don't set it to down until
+            %% the node is back and we can re-monitor
+            Members = Members0#{DownNode =>
+                                Member#member{state = {disconnected, E, Pid}}},
+            Stream0#stream{members = Members};
+        #{DownNode := #member{role = {replica, _},
+                              state = {S, _, Pid}} = Member}
+          when S == running orelse S == disconnected ->
             %% the down process is currently running with the correct Pid
             %% set state to down
             Members = Members0#{DownNode => Member#member{state = {down, E}}},
             Stream0#stream{members = Members};
         _ ->
+            rabbit_log:debug("NOT HANDLED ~p ~w", [maps:get(DownNode, Members0), Pid]),
             Stream0
-    end.
+    end;
+update_stream(#{system_time := _Ts},
+              {down, _Pid, _Reason}, undefined) ->
+    undefined;
+update_stream(#{system_time := _Ts} = _Meta,
+              {nodeup, Node},
+              #stream{members = Members0} = Stream0) ->
+    Members = maps:map(
+                fun (_, #member{node = N,
+                                current = {sleeping, nodeup}} = M)
+                      when N == Node ->
+                        M#member{current = undefined};
+                    (_, M) ->
+                        M
+                end, Members0),
+    Stream0#stream{members = Members};
+update_stream(#{system_time := _Ts},
+              {policy_changed, _StreamId, #{queue := Q}},
+              #stream{conf = Conf0,
+                      members = _Members0} = Stream0) ->
+    Conf = rabbit_stream_queue:update_stream_conf(Q, Conf0),
+    Stream0#stream{conf = Conf}.
 
 eval_listeners(#stream{listeners = Listeners0,
                        queue_ref = QRef,
@@ -1241,11 +1179,35 @@ eval_listeners(#stream{listeners = Listeners0,
             {Stream, Effects0}
     end.
 
+eval_retention(#{index := Idx} = Meta,
+               #stream{conf = #{retention := Ret} = Conf,
+                       id = StreamId,
+                       epoch = Epoch,
+                       members = Members} = Stream, Effects0) ->
+    NeedUpdate = maps:filter(
+                   fun (_, #member{state = {running, _, _},
+                                   current = undefined,
+                                   conf = C}) ->
+                           Ret =/= maps:get(retention, C, undefined);
+                       (_, _) ->
+                           false
+                   end, Members),
+    Args = Meta#{epoch => Epoch},
+    Effs = [{aux, {update_retention, StreamId,
+                   Args#{pid => Pid,
+                         node => node(Pid),
+                         retention => Ret}, Conf}}
+            || #member{state = {running, _, Pid}} <- maps:values(NeedUpdate)],
+    Updated = maps:map(fun (_, M) -> M#member{current = {updating, Idx}} end,
+                       NeedUpdate),
+    {Stream#stream{members = maps:merge(Members, Updated)}, Effs ++ Effects0}.
+
 
 %% this function should be idempotent,
 %% it should modify the state such that it won't issue duplicate
 %% actions when called again
-evaluate_stream(#stream{id = StreamId,
+evaluate_stream(#{index := Idx} = Meta,
+                #stream{id = StreamId,
                         reply_to = From,
                         epoch = Epoch,
                         mnesia = {MnesiaTag, MnesiaEpoch},
@@ -1258,7 +1220,7 @@ evaluate_stream(#stream{id = StreamId,
            when LState =/= deleted ->
              Action = {aux, {delete_member, StreamId, LeaderNode,
                              make_writer_conf(Writer0, Stream0)}},
-             Writer = Writer0#member{current = deleting},
+             Writer = Writer0#member{current = {deleting, Idx}},
              Effs = case From of
                         undefined ->
                             [Action | Effs0];
@@ -1266,17 +1228,19 @@ evaluate_stream(#stream{id = StreamId,
                             wrap_reply(From, {ok, 0}) ++ [Action | Effs0]
                     end,
              Stream = Stream0#stream{reply_to = undefined},
-             eval_replicas(Writer, Replicas, Stream, Effs);
+             eval_replicas(Meta, Writer, Replicas, Stream, Effs);
          {#member{state = {down, Epoch},
                   node = LeaderNode,
                   current = undefined} = Writer0, Replicas} ->
              %% leader is down - all replicas need to be stopped
              %% and tail infos retrieved
              %% some replicas may already be in stopping or ready state
-             Action = {aux, {stop, StreamId, LeaderNode, Epoch,
-                             make_writer_conf(Writer0, Stream0)}},
-             Writer = Writer0#member{current = stopping},
-             eval_replicas(Writer, Replicas, Stream0, [Action | Effs0]);
+             Args = Meta#{epoch => Epoch,
+                          node => LeaderNode},
+             Conf = make_writer_conf(Writer0, Stream0),
+             Action = {aux, {stop, StreamId, Args, Conf}},
+             Writer = Writer0#member{current = {stopping, Idx}},
+             eval_replicas(Meta, Writer, Replicas, Stream0, [Action | Effs0]);
          {#member{state = {ready, Epoch}, %% writer ready in current epoch
                   target = running,
                   node = LeaderNode,
@@ -1284,10 +1248,12 @@ evaluate_stream(#stream{id = StreamId,
              %% ready check has been completed and a new leader has been chosen
              %% time to start writer,
              %% if leader start fails, revert back to down state for all and re-run
+             WConf = make_writer_conf(Writer0, Stream0),
              Members = Members0#{LeaderNode =>
-                                 Writer0#member{current = starting}},
-             Actions = [{aux, {start_writer, StreamId,
-                               make_writer_conf(Writer0, Stream0)}} | Effs0],
+                                 Writer0#member{current = {starting, Idx},
+                                                conf = WConf}},
+             Args = Meta#{node => LeaderNode, epoch => Epoch},
+             Actions = [{aux, {start_writer, StreamId, Args, WConf}} | Effs0],
              {Stream0#stream{members = Members}, Actions};
          {#member{state = {running, Epoch, LeaderPid},
                   target = running} = Writer, Replicas}
@@ -1295,46 +1261,48 @@ evaluate_stream(#stream{id = StreamId,
              %% we need a reply effect here
              Effs = wrap_reply(From, {ok, LeaderPid}) ++ Effs0,
              Stream = Stream0#stream{reply_to = undefined},
-             eval_replicas(Writer, Replicas, Stream, Effs);
+             eval_replicas(Meta, Writer, Replicas, Stream, Effs);
          {#member{state = {running, Epoch, LeaderPid}} = Writer, Replicas}
            when MnesiaTag == updated andalso MnesiaEpoch < Epoch ->
              Effs = [{aux, {update_mnesia, StreamId,
                             make_replica_conf(LeaderPid, Stream0)}} |  Effs0],
              Stream = Stream0#stream{mnesia = {updating, MnesiaEpoch}},
-             eval_replicas(Writer, Replicas, Stream, Effs);
+             eval_replicas(Meta, Writer, Replicas, Stream, Effs);
          {#member{state = S,
                   target = stopped,
                   node = LeaderNode,
                   current = undefined} = Writer0, Replicas}
            when element(1, S) =/= stopped ->
              %% leader should be stopped
-             Action = {aux, {stop, StreamId, LeaderNode, Epoch,
+             Args = Meta#{node => LeaderNode, epoch => Epoch},
+             Action = {aux, {stop, StreamId, Args,
                              make_writer_conf(Writer0, Stream0)}},
-             Writer = Writer0#member{current = stopping},
-             eval_replicas(Writer, Replicas, Stream0, [Action | Effs0]);
+             Writer = Writer0#member{current = {stopping, Idx}},
+             eval_replicas(Meta, Writer, Replicas, Stream0, [Action | Effs0]);
          {Writer, Replicas} ->
-             eval_replicas(Writer, Replicas, Stream0, Effs0)
+             eval_replicas(Meta, Writer, Replicas, Stream0, Effs0)
      end.
 
-eval_replicas(undefined, Replicas, Stream, Actions0) ->
+eval_replicas(Meta, undefined, Replicas, Stream, Actions0) ->
     {Members, Actions} = lists:foldl(
                            fun (R, Acc) ->
-                                   eval_replica(R, deleted, Stream, Acc)
+                                   eval_replica(Meta, R, deleted, Stream, Acc)
                            end, {#{}, Actions0},
                            Replicas),
     {Stream#stream{members = Members}, Actions};
-eval_replicas(#member{state = LeaderState,
-                      node = WriterNode} = Writer, Replicas,
+eval_replicas(Meta, #member{state = LeaderState,
+                            node = WriterNode} = Writer, Replicas,
               Stream, Actions0) ->
     {Members, Actions} = lists:foldl(
                            fun (R, Acc) ->
-                                   eval_replica(R, LeaderState,
+                                   eval_replica(Meta, R, LeaderState,
                                                 Stream, Acc)
                            end, {#{WriterNode => Writer}, Actions0},
                            Replicas),
     {Stream#stream{members = Members}, Actions}.
 
-eval_replica(#member{state = _State,
+eval_replica(#{index := Idx} = Meta,
+             #member{state = _State,
                      target = stopped,
                      node = Node,
                      current = undefined} = Replica,
@@ -1345,28 +1313,31 @@ eval_replica(#member{state = _State,
              {Replicas, Actions}) ->
     %% if we're not running anything and we aren't stopped and not caught
     %% by previous clauses we probably should stop
-    {Replicas#{Node => Replica#member{current = stopping}},
-     [{aux, {stop, StreamId, Node, Epoch, Conf}} | Actions]};
-eval_replica(#member{state = _,
-                     node = Node,
-                     current = Current,
-                     target = deleted} = Replica,
+    Args = Meta#{node => Node, epoch => Epoch},
+    {Replicas#{Node => Replica#member{current = {stopping, Idx}}},
+     [{aux, {stop, StreamId, Args, Conf}} | Actions]};
+eval_replica(#{index := Idx} = Meta, #member{state = _,
+                                             node = Node,
+                                             current = Current,
+                                             target = deleted} = Replica,
              _LeaderState, #stream{id = StreamId,
+                                   epoch = Epoch,
                                    conf = Conf}, {Replicas, Actions0}) ->
 
     case Current of
         undefined ->
-            Actions = [{aux, {delete_member, StreamId, Node, Conf}} |
+            Args = Meta#{epoch => Epoch, node => Node},
+            Actions = [{aux, {delete_member, StreamId, Args, Conf}} |
                        Actions0],
-            {Replicas#{Node => Replica#member{current = deleting}},
+            {Replicas#{Node => Replica#member{current = {deleting, Idx}}},
              Actions};
         _ ->
             {Replicas#{Node => Replica}, Actions0}
     end;
-eval_replica(#member{state = {State, Epoch},
-                     node = Node,
-                     target = running,
-                     current = undefined} = Replica,
+eval_replica(#{index := Idx} = Meta, #member{state = {State, Epoch},
+                            node = Node,
+                            target = running,
+                            current = undefined} = Replica,
              {running, Epoch, Pid},
              #stream{id = StreamId,
                      epoch = Epoch} = Stream,
@@ -1375,54 +1346,32 @@ eval_replica(#member{state = {State, Epoch},
     %% replica is down or ready and the leader is running
     %% time to start it
     Conf = make_replica_conf(Pid, Stream),
-    {Replicas#{Node => Replica#member{current = starting}},
-     [{aux, {start_replica, StreamId, Node, Conf}} | Actions]};
-eval_replica(#member{state = {running, Epoch, _},
-                     target = running,
-                     node = Node} = Replica,
+    Args = Meta#{node => Node, epoch => Epoch},
+    {Replicas#{Node => Replica#member{current = {starting, Idx},
+                                      conf = Conf}},
+     [{aux, {start_replica, StreamId, Args, Conf}} | Actions]};
+eval_replica(_Meta, #member{state = {running, Epoch, _},
+                            target = running,
+                            node = Node} = Replica,
              {running, Epoch, _}, _Stream, {Replicas, Actions}) ->
     {Replicas#{Node => Replica}, Actions};
-eval_replica(#member{state = {stopped, _E, _},
-                     node = Node,
-                     current = undefined} = Replica,
+eval_replica(_Meta, #member{state = {stopped, _E, _},
+                            node = Node,
+                            current = undefined} = Replica,
              _LeaderState, _Stream,
              {Replicas, Actions}) ->
     %%  if stopped we should just wait for a quorum to reach stopped and
     %%  update_stream will move to ready state
     {Replicas#{Node => Replica}, Actions};
-eval_replica(#member{state = {ready, E},
-                     target = running,
-                     node = Node,
-                     current = undefined} = Replica,
+eval_replica(_Meta, #member{state = {ready, E},
+                            target = running,
+                            node = Node,
+                            current = undefined} = Replica,
              {ready, E}, _Stream,
              {Replicas, Actions}) ->
     %% if we're ready and so is the leader we just wait a swell
     {Replicas#{Node => Replica}, Actions};
-% eval_replica(#member{state = _State,
-%                      node = Node,
-%                      current = undefined} = Replica,
-%              _LeaderState,
-%              #stream{id = StreamId,
-%                      epoch = Epoch,
-%                      conf = Conf},
-%              {Replicas, Actions}) ->
-%     %% if we're not running anything and we aren't stopped and not caught
-%     %% by previous clauses we probably should stop
-%     {Replicas#{Node => Replica#member{current = stopping}},
-%      [{aux, {stop, StreamId, Node, Epoch, Conf}} | Actions]};
-% eval_replica(#member{state = {down, _},
-%                      node = Node,
-%                      current = undefined} = Replica,
-%              {running, Epoch, _},
-%              #stream{id = StreamId,
-%                      epoch = Epoch,
-%                      conf = Conf},
-%              {Replicas, Actions}) ->
-%     %% replica is down and leader is running in current epoch
-%     %% need to stop
-%     {Replicas#{Node => Replica#member{current = stopping}},
-%      [{aux, {stop, StreamId, Node, Epoch, Conf}} | Actions]};
-eval_replica(#member{node = Node} = Replica, _LeaderState, _Stream,
+eval_replica(_Meta, #member{node = Node} = Replica, _LeaderState, _Stream,
              {Replicas, Actions}) ->
     {Replicas#{Node => Replica}, Actions}.
 
@@ -1440,11 +1389,14 @@ fail_active_actions(Streams, Exclude) ->
 fail_action(_StreamId, #member{current = undefined}) ->
     ok;
 fail_action(StreamId, #member{role = {_, E},
-                              current = Action,
+                              current = {Action, Idx},
                               node = Node}) ->
+    rabbit_log:debug("~s: failing active action for ~s node ~w Action ~w",
+                     [?MODULE, StreamId, Node, Action]),
     %% if we have an action send failure message
     send_self_command({action_failed, StreamId,
                        #{action => Action,
+                         index => Idx,
                          node => Node,
                          epoch => E}}).
 
@@ -1535,7 +1487,7 @@ new_stream_test() ->
                  S0),
 
     %% we expect the next action to be starting the writer
-    {S1, Actions} = evaluate_stream(S0, []),
+    {S1, Actions} = evaluate_stream(meta(?LINE), S0, []),
     ?assertMatch([{aux, {start_writer, StreamId, #{epoch := E,
                                                    leader_node := N1,
                                                    replica_nodes := [N2, N3]}}}],
@@ -1557,7 +1509,7 @@ new_stream_test() ->
                                              current = undefined,
                                              state = {running, E, E1LeaderPid}}}},
                          S2),
-    {S3, Actions2} = evaluate_stream(S2, []),
+    {S3, Actions2} = evaluate_stream(meta(?LINE), S2, []),
     ?assertMatch([{aux, {start_replica, StreamId, N2,
                          #{epoch := E,
                            leader_pid := E1LeaderPid,
@@ -1584,11 +1536,11 @@ new_stream_test() ->
     R1Pid = fake_pid(N2),
     S4 = update_stream(Meta, {member_started, StreamId,
                               #{epoch => E, pid => R1Pid}}, S3),
-    {S5, [{aux, {update_mnesia, _, _}}]} = evaluate_stream(S4, []),
+    {S5, [{aux, {update_mnesia, _, _}}]} = evaluate_stream(meta(?LINE), S4, []),
     R2Pid = fake_pid(N3),
     S6 = update_stream(Meta, {member_started, StreamId,
                               #{epoch => E, pid => R2Pid}}, S5),
-    {S7, []} = evaluate_stream(S6, []),
+    {S7, []} = evaluate_stream(meta(?LINE), S6, []),
     %% actions should have start_replica requests
     ?assertMatch(#stream{nodes = Nodes,
                          members = #{N1 := #member{role = {writer, E},
@@ -1625,7 +1577,7 @@ leader_down_test() ->
                                                    current = undefined,
                                                    state = {running, E, Replica2}}}},
                  S1),
-    {S2, Actions} = evaluate_stream(S1, []),
+    {S2, Actions} = evaluate_stream(meta(?LINE), S1, []),
     %% expect all members to be stopping now
     %% replicas will receive downs however as will typically exit if leader does
     %% this is ok
@@ -1644,7 +1596,7 @@ leader_down_test() ->
                  S2),
 
     %% idempotency check
-    {S2, []} = evaluate_stream(S2, []),
+    {S2, []} = evaluate_stream(meta(?LINE), S2, []),
     N2Tail = {E, 101},
     S3 = update_stream(meta(?LINE), {member_stopped, StreamId, #{node => N2,
                                                                  epoch => E,
@@ -1653,7 +1605,7 @@ leader_down_test() ->
                                                    current = undefined,
                                                    state = {stopped, E, N2Tail}}}},
                  S3),
-    {S3, []} = evaluate_stream(S3, []),
+    {S3, []} = evaluate_stream(meta(?LINE), S3, []),
     N3Tail = {E, 102},
     S4 = update_stream(meta(?LINE), {member_stopped, StreamId, #{node => N3,
                                                                  epoch => E,
@@ -1671,7 +1623,7 @@ leader_down_test() ->
                                                    current = undefined,
                                                    state = {ready, E2}}}},
                  S4),
-    {S5, Actions4} = evaluate_stream(S4, []),
+    {S5, Actions4} = evaluate_stream(meta(?LINE), S4, []),
     %% new leader has been selected so should be started
     ?assertMatch([{aux, {start_writer, StreamId, #{leader_node := N3}}}],
                   lists:sort(Actions4)),
@@ -1692,7 +1644,7 @@ leader_down_test() ->
                                                    current = undefined,
                                                    state = {running, E2, E2LeaderPid}}}},
                  S6),
-    {S7, Actions6} = evaluate_stream(S6, []),
+    {S7, Actions6} = evaluate_stream(meta(?LINE), S6, []),
     ?assertMatch([{aux, {update_mnesia, _, _}},
                   {aux, {start_replica, StreamId, N2,
                          #{leader_pid := E2LeaderPid}}}],
@@ -1716,7 +1668,7 @@ leader_down_test() ->
                                                    state = {running, E2, E2RepllicaN2Pid}}}},
                  S8),
     %% nothing to do
-    {S8, []} = evaluate_stream(S8, []),
+    {S8, []} = evaluate_stream(meta(?LINE), S8, []),
 
     S9 = update_stream(meta(?LINE), {action_failed, StreamId,
                                      #{action => stopping,
@@ -1727,7 +1679,7 @@ leader_down_test() ->
                                                    state = {down, E}}}},
                  S9),
 
-    {S10, Actions9} = evaluate_stream(S9, []),
+    {S10, Actions9} = evaluate_stream(meta(?LINE), S9, []),
     %% retries action
     ?assertMatch([{aux, {stop, StreamId, N1, E2, _}}], lists:sort(Actions9)),
     ?assertMatch(#stream{members = #{N1 := #member{role = {replica, E2},
@@ -1747,7 +1699,7 @@ leader_down_test() ->
                                                    state = {ready, E2}}}},
                  S11),
 
-    {S12, Actions11} = evaluate_stream(S11, []),
+    {S12, Actions11} = evaluate_stream(meta(?LINE), S11, []),
     ?assertMatch([{aux, {start_replica, StreamId, N1,
                          #{leader_pid := E2LeaderPid}}}],
                  lists:sort(Actions11)),
@@ -1779,7 +1731,7 @@ replica_down_test() ->
                                                    current = undefined,
                                                    state = {running, E, Replica2}}}},
                  S1),
-    {S2, Actions} = evaluate_stream(S1, []),
+    {S2, Actions} = evaluate_stream(meta(?LINE), S1, []),
     ?assertMatch([
                   {aux, {start_replica, StreamId, N2,
                          #{leader_pid := LeaderPid}}}
@@ -1808,25 +1760,26 @@ leader_start_failed_test() ->
 
     S0 = started_stream(StreamId, LeaderPid, ReplicaPids),
     S1 = update_stream(meta(?LINE), {down, LeaderPid, boom}, S0),
-    {S2, _Actions} = evaluate_stream(S1, []),
+    {S2, _Actions} = evaluate_stream(meta(?LINE), S1, []),
     %% leader was down but a temporary reconnection allowed the stop to complete
     S3 = update_stream(meta(?LINE),
                        {member_stopped, StreamId, #{node => N1,
                                                     epoch => E,
                                                     tail => {1, 2}}}, S2),
 
-    {S3, []} = evaluate_stream(S3, []),
+    {S3, []} = evaluate_stream(meta(?LINE), S3, []),
     S4 = update_stream(meta(?LINE),
                        {member_stopped, StreamId, #{node => N2,
                                                     epoch => E,
                                                     tail => {1, 1}}}, S3),
     E2 = E+1,
-    {S5, Actions4} = evaluate_stream(S4, []),
-    ?assertMatch([{aux, {start_writer, StreamId, #{epoch := E2,
+    {S5, Actions4} = evaluate_stream(meta(?LINE), S4, []),
+    ?assertMatch([{aux, {start_writer, StreamId, _, #{epoch := E2,
                                                    leader_node := N1}}}],
                   lists:sort(Actions4)),
     S6 = update_stream(meta(?LINE),
                        {action_failed, StreamId, #{node => N1,
+                                                   action => starting,
                                                    epoch => E2}}, S5),
     ?assertMatch(#stream{members = #{N1 := #member{role = {writer, E2},
                                                    current = undefined,
@@ -1841,8 +1794,8 @@ leader_start_failed_test() ->
                                                    current = stopping,
                                                    state = {running, E, _}}}},
                  S6),
-    E3 = E2+1,
-    {S7, Actions6} = evaluate_stream(S6, []),
+    % E3 = E2+1,
+    {S7, Actions6} = evaluate_stream(meta(?LINE), S6, []),
     ?assertMatch([{aux, {stop, StreamId, N1, E2, _}},
                   {aux, {stop, StreamId, N2, E2, _}}
                  ], lists:sort(Actions6)),
@@ -1864,7 +1817,7 @@ leader_start_failed_test() ->
                                                    current = undefined,
                                                    state = {stopped, E, _}}}},
                  S8),
-    {_S9, Actions8} = evaluate_stream(S8, []),
+    {_S9, Actions8} = evaluate_stream(meta(?LINE), S8, []),
     ?assertMatch([{aux, {stop, StreamId, N3, E2, _}}
                  ], lists:sort(Actions8)),
 
@@ -1895,7 +1848,7 @@ leader_down_scenario_1_test() ->
                                                    current = undefined,
                                                    state = {running, E, Replica2}}}},
                  S1),
-    {S2, Actions} = evaluate_stream(S1, []),
+    {S2, Actions} = evaluate_stream(meta(?LINE), S1, []),
     %% expect all members to be stopping now
     %% replicas will receive downs however as will typically exit if leader does
     %% this is ok
@@ -1914,7 +1867,7 @@ leader_down_scenario_1_test() ->
                  S2),
 
     %% idempotency check
-    {S2, []} = evaluate_stream(S2, []),
+    {S2, []} = evaluate_stream(meta(?LINE), S2, []),
     N2Tail = {E, 101},
     S3 = update_stream(meta(?LINE), {member_stopped, StreamId, #{node => N2,
                                                                  epoch => E,
@@ -1923,7 +1876,7 @@ leader_down_scenario_1_test() ->
                                                    current = undefined,
                                                    state = {stopped, E, N2Tail}}}},
                  S3),
-    {S3, []} = evaluate_stream(S3, []),
+    {S3, []} = evaluate_stream(meta(?LINE), S3, []),
     N3Tail = {E, 102},
     S4 = update_stream(meta(?LINE), {member_stopped, StreamId, #{node => N3,
                                                                  epoch => E,
@@ -1941,9 +1894,9 @@ leader_down_scenario_1_test() ->
                                                    current = undefined,
                                                    state = {ready, E2}}}},
                  S4),
-    {S5, Actions4} = evaluate_stream(S4, []),
+    {S5, Actions4} = evaluate_stream(meta(?LINE), S4, []),
     %% new leader has been selected so should be started
-    ?assertMatch([{aux, {start_writer, StreamId, #{leader_node := N3}}}],
+    ?assertMatch([{aux, {start_writer, StreamId, _Args, #{leader_node := N3}}}],
                   lists:sort(Actions4)),
     ?assertMatch(#stream{epoch = E2}, S5),
 
@@ -1962,7 +1915,7 @@ leader_down_scenario_1_test() ->
                                                    current = undefined,
                                                    state = {running, E2, E2LeaderPid}}}},
                  S6),
-    {S6b, Actions6} = evaluate_stream(S6, []),
+    {S6b, Actions6} = evaluate_stream(meta(?LINE), S6, []),
     ?assertMatch([
                   {aux, {update_mnesia, _, _}},
                   {aux, {start_replica, StreamId, N2, _}}
@@ -1970,7 +1923,7 @@ leader_down_scenario_1_test() ->
                  lists:sort(Actions6)),
 
     S7 = update_stream(meta(?LINE), {down, E2LeaderPid, boom}, S6b),
-    {S8, Actions7} = evaluate_stream(S7, []),
+    {S8, Actions7} = evaluate_stream(meta(?LINE), S7, []),
     ?assertMatch([{aux, {stop, StreamId, N3, E2, _}}], lists:sort(Actions7)),
     ?assertMatch(#stream{members = #{N1 := #member{role = {replica, E2},
                                                    current = stopping,
@@ -1991,7 +1944,7 @@ leader_down_scenario_1_test() ->
                                                    current = undefined,
                                                    state = {stopped, E2, N3Tail}}}},
                  S9),
-    {S10, []} = evaluate_stream(S9, []),
+    {S10, []} = evaluate_stream(meta(?LINE), S9, []),
     S11 = update_stream(meta(?LINE), {action_failed, StreamId,
                                       #{action => starting,
                                         node => N2,
@@ -2001,7 +1954,7 @@ leader_down_scenario_1_test() ->
                                                    current = undefined,
                                                    state = {ready, E2}}}},
                  S11),
-    {S12, Actions11} = evaluate_stream(S11, []),
+    {S12, Actions11} = evaluate_stream(meta(?LINE), S11, []),
     ?assertMatch([{aux, {stop, StreamId, N2, E2, _}}], lists:sort(Actions11)),
     ?assertMatch(#stream{members = #{N2 := #member{role = {replica, E2},
                                                    current = stopping,
@@ -2053,7 +2006,7 @@ delete_stream_test() ->
                                                    state = _}
                                     }},
                  S1),
-    {S2, Actions1} = evaluate_stream(S1, []),
+    {S2, Actions1} = evaluate_stream(meta(?LINE), S1, []),
     %% expect all members to be stopping now
     %% replicas will receive downs however as will typically exit if leader does
     %% this is ok
@@ -2080,7 +2033,7 @@ delete_stream_test() ->
     ?assertMatch(#stream{target = deleted,
                          members = #{N2 := _, N3 := _} = M3}
                    when not is_map_key(N1, M3), S3),
-    {S4, []} = evaluate_stream(S3, []),
+    {S4, []} = evaluate_stream(meta(?LINE), S3, []),
     ?assertMatch(#stream{target = deleted,
                          members = #{N2 := _, N3 := _} = M3}
                    when not is_map_key(N1, M3), S4),
@@ -2089,7 +2042,7 @@ delete_stream_test() ->
     ?assertMatch(#stream{target = deleted,
                          members = #{N3 := _} = M5}
                    when not is_map_key(N2, M5), S5),
-    {S6, []} = evaluate_stream(S5, []),
+    {S6, []} = evaluate_stream(meta(?LINE), S5, []),
     S7 = update_stream(meta(?LINE), {member_deleted, StreamId, #{node => N3}},
                        S6),
     ?assertEqual(undefined, S7),
@@ -2122,7 +2075,7 @@ add_replica_test() ->
                                                    state = {down, 0}}
                                     }},
                  S1),
-    {S2, Actions1} = evaluate_stream(S1, []),
+    {S2, Actions1} = evaluate_stream(meta(?LINE), S1, []),
     ?assertMatch([{aux, {stop, StreamId, N1, E, _}},
                   {aux, {stop, StreamId, N2, E, _}},
                   {aux, {stop, StreamId, N3, E, _}}], lists:sort(Actions1)),
@@ -2156,7 +2109,7 @@ add_replica_test() ->
                                                    current = stopping,
                                                    state = {down, 0}}
                                     }}, S3),
-    {S3, []} = evaluate_stream(S3, []),
+    {S3, []} = evaluate_stream(meta(?LINE), S3, []),
     N2Tail = {E, 100},
     S4 = update_stream(meta(?LINE), {member_stopped, StreamId, #{node => N2,
                                                                  epoch => E,
@@ -2175,9 +2128,9 @@ add_replica_test() ->
                                                    current = stopping,
                                                    state = {down, 0}}
                                     }}, S4),
-    {S3, []} = evaluate_stream(S3, []),
-    {S5, Actions4} = evaluate_stream(S4, []),
-    ?assertMatch([{aux, {start_writer, StreamId, #{leader_node := N1}}}],
+    {S3, []} = evaluate_stream(meta(?LINE), S3, []),
+    {S5, Actions4} = evaluate_stream(meta(?LINE), S4, []),
+    ?assertMatch([{aux, {start_writer, StreamId, _Args, #{leader_node := N1}}}],
                   lists:sort(Actions4)),
     ?assertMatch(#stream{epoch = E2}, S5),
     S6 = update_stream(meta(?LINE), {member_stopped, StreamId, #{node => N3,
@@ -2227,7 +2180,7 @@ delete_replica_test() ->
                                                    state = {running, _, _}}
                                     }},
                  S1),
-    {S2, Actions1} = evaluate_stream(S1, []),
+    {S2, Actions1} = evaluate_stream(meta(?LINE), S1, []),
     ?assertMatch([{aux, {delete_member, StreamId, N3, _}},
                   {aux, {stop, StreamId, N1, E, _}},
                   {aux, {stop, StreamId, N2, E, _}}], lists:sort(Actions1)),
@@ -2243,19 +2196,19 @@ delete_replica_test() ->
                                                    state = {running, _, _}}
                                     } = Members}
                    when not is_map_key(N3, Members), S3),
-    {S3, []} = evaluate_stream(S3, []),
+    {S3, []} = evaluate_stream(meta(?LINE), S3, []),
     S4 = update_stream(meta(?LINE),
                        {member_stopped, StreamId, #{node => N1,
                                                     epoch => E,
                                                     tail => {E, 100}}},
                        S3),
-    {S4, []} = evaluate_stream(S4, []),
+    {S4, []} = evaluate_stream(meta(?LINE), S4, []),
     S5 = update_stream(meta(?LINE),
                        {member_stopped, StreamId, #{node => N2,
                                                     epoch => E,
                                                     tail => {E, 101}}},
                        S4),
-    {S6, Actions5} = evaluate_stream(S5, []),
+    {S6, Actions5} = evaluate_stream(meta(?LINE), S5, []),
     E2 = E + 1,
     ?assertMatch(#stream{target = running,
                          nodes = [N1, N2],
@@ -2267,9 +2220,9 @@ delete_replica_test() ->
                                                    current = starting,
                                                    state = {ready, E2}}
                                     }}, S6),
-    ?assertMatch([{aux, {start_writer, StreamId, #{nodes := [N1, N2]}}}
+    ?assertMatch([{aux, {start_writer, StreamId, _Args, #{nodes := [N1, N2]}}}
                   ], lists:sort(Actions5)),
-    {S4, []} = evaluate_stream(S4, []),
+    {S4, []} = evaluate_stream(meta(?LINE), S4, []),
     ok.
 
 delete_replica_leader_test() ->
@@ -2297,7 +2250,7 @@ delete_replica_leader_test() ->
                                                    state = {running, _, _}}
                                     }},
                  S1),
-    {S2, Actions1} = evaluate_stream(S1, []),
+    {S2, Actions1} = evaluate_stream(meta(?LINE), S1, []),
     ?assertMatch([{aux, {delete_member, StreamId, N1, _}},
                   {aux, {stop, StreamId, N2, E, _}}], lists:sort(Actions1)),
     S3 = S2,
@@ -2320,12 +2273,12 @@ delete_replica_leader_test() ->
                  S4),
     ok.
 
-meta(Ts) ->
-    #{system_time => Ts}.
+meta(N) ->
+    #{index => N,
+      system_time => N + 1000}.
 
 started_stream(StreamId, LeaderPid, ReplicaPids) ->
     E = 1,
-    Ts = 0,
     Nodes = [node(LeaderPid) | [node(P) || P <- ReplicaPids]],
     Conf = #{name => StreamId,
              nodes => Nodes},
@@ -2337,15 +2290,13 @@ started_stream(StreamId, LeaderPid, ReplicaPids) ->
     Members0 = #{node(LeaderPid) => #member{role = {writer, E},
                                             node = node(LeaderPid),
                                             state = {running, E, LeaderPid},
-                                            current = undefined,
-                                            current_ts = Ts}},
+                                            current = undefined}},
     Members = lists:foldl(fun (R, Acc) ->
                                   N = node(R),
                                   Acc#{N => #member{role = {replica, E},
                                                     node = N,
                                                     state = {running, E, R},
-                                                    current = undefined,
-                                                    current_ts = Ts}}
+                                                    current = undefined}}
                           end, Members0, ReplicaPids),
 
 
