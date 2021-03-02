@@ -410,7 +410,7 @@ handle_tick(QName,
                       Up = case ra:consistent_query(amqqueue:get_pid(Queue), fun (_) -> ok end) of
                           {ok, ok, _} -> 1;
                           _ ->
-                              rabbit_log:debug("ra:consistent_query failed for queue ~p~n", [QName]),
+                              rabbit_log:debug("ra:consistent_query failed for ~s~n", [rabbit_misc:rs(QName)]),
                               0
                       end,
                       rabbit_core_metrics:queue_stats(QName, [{up, Up} | Infos]),
