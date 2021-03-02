@@ -577,7 +577,7 @@ handle_aux(leader, _, {update_mnesia, StreamId, Args, Conf},
 handle_aux(leader, _, {update_retention, StreamId, Args, _Conf},
            #aux{actions = _Monitors} = Aux, LogState,
            #?MODULE{streams = _Streams}) ->
-    rabbit_log:debug("rabbit_stream_coordinator: running action: 'update_mnesia'"
+    rabbit_log:debug("rabbit_stream_coordinator: running action: 'update_retention'"
                      " for ~s", [StreamId]),
     ActionFun = fun () -> phase_update_retention(StreamId, Args) end,
     run_action(update_retention, StreamId, Args, ActionFun, Aux, LogState);
@@ -800,7 +800,7 @@ is_quorum(NumReplicas, NumAlive) ->
     NumAlive >= ((NumReplicas div 2) + 1).
 
 phase_update_mnesia(StreamId, Args, #{reference := QName,
-                                       leader_pid := LeaderPid} = Conf) ->
+                                      leader_pid := LeaderPid} = Conf) ->
 
     rabbit_log:debug("~s: running mnesia update for ~s: ~W",
                      [?MODULE, StreamId, Conf, 10]),
@@ -813,11 +813,15 @@ phase_update_mnesia(StreamId, Args, #{reference := QName,
                                  rabbit_amqqueue:update(QName, Fun)
                          end) of
                       not_found ->
+                          rabbit_log:debug("~s: mnesia update for ~s: not_found",
+                                           [?MODULE, StreamId]),
                           %% This can happen during recovery
                           [Q] = mnesia:dirty_read(rabbit_durable_queue, QName),
-                          rabbit_amqqueue:ensure_rabbit_queue_record_is_initialized(Fun(Q));
+                          %% TODO: what is the possible return type here?
+                          _ = rabbit_amqqueue:ensure_rabbit_queue_record_is_initialized(Fun(Q)),
+                          send_self_command({mnesia_updated, StreamId, Args});
                       _ ->
-                          send_self_command({mnesia_updated, StreamId, Conf})
+                          send_self_command({mnesia_updated, StreamId, Args})
                   catch _:E ->
                             rabbit_log:debug("~s: failed to update mnesia for ~s: ~W",
                                              [?MODULE, StreamId, E, 10]),
@@ -1256,18 +1260,27 @@ evaluate_stream(#{index := Idx} = Meta,
              Actions = [{aux, {start_writer, StreamId, Args, WConf}} | Effs0],
              {Stream0#stream{members = Members}, Actions};
          {#member{state = {running, Epoch, LeaderPid},
-                  target = running} = Writer, Replicas}
-           when From =/= undefined ->
-             %% we need a reply effect here
-             Effs = wrap_reply(From, {ok, LeaderPid}) ++ Effs0,
-             Stream = Stream0#stream{reply_to = undefined},
-             eval_replicas(Meta, Writer, Replicas, Stream, Effs);
-         {#member{state = {running, Epoch, LeaderPid}} = Writer, Replicas}
-           when MnesiaTag == updated andalso MnesiaEpoch < Epoch ->
-             Effs = [{aux, {update_mnesia, StreamId,
-                            make_replica_conf(LeaderPid, Stream0)}} |  Effs0],
-             Stream = Stream0#stream{mnesia = {updating, MnesiaEpoch}},
-             eval_replicas(Meta, Writer, Replicas, Stream, Effs);
+                  target = running} = Writer, Replicas} ->
+
+             Effs1 = case From of
+                         undefined ->
+                             Effs0;
+                         _ ->
+                             %% we need a reply effect here
+                             wrap_reply(From, {ok, LeaderPid}) ++ Effs0
+                     end,
+             Stream1 = Stream0#stream{reply_to = undefined},
+             case MnesiaTag == updated andalso MnesiaEpoch < Epoch of
+                 true ->
+                     Args = Meta#{node => node(LeaderPid), epoch => Epoch},
+                     Effs = [{aux,
+                              {update_mnesia, StreamId, Args,
+                               make_replica_conf(LeaderPid, Stream1)}} | Effs1],
+                     Stream = Stream1#stream{mnesia = {updating, MnesiaEpoch}},
+                     eval_replicas(Meta, Writer, Replicas, Stream, Effs);
+                 false ->
+                     eval_replicas(Meta, Writer, Replicas, Stream1, Effs1)
+             end;
          {#member{state = S,
                   target = stopped,
                   node = LeaderNode,
@@ -1488,9 +1501,11 @@ new_stream_test() ->
 
     %% we expect the next action to be starting the writer
     {S1, Actions} = evaluate_stream(meta(?LINE), S0, []),
-    ?assertMatch([{aux, {start_writer, StreamId, #{epoch := E,
-                                                   leader_node := N1,
-                                                   replica_nodes := [N2, N3]}}}],
+    ?assertMatch([{aux, {start_writer, StreamId,
+                         #{node := N1, epoch := E, index := _},
+                         #{epoch := E,
+                           leader_node := N1,
+                           replica_nodes := [N2, N3]}}}],
                  Actions),
     ?assertMatch(#stream{nodes = Nodes,
                          members = #{N1 := #member{role = {writer, E},
@@ -1577,13 +1592,21 @@ leader_down_test() ->
                                                    current = undefined,
                                                    state = {running, E, Replica2}}}},
                  S1),
-    {S2, Actions} = evaluate_stream(meta(?LINE), S1, []),
+    Idx2 = ?LINE,
+    {S2, Actions} = evaluate_stream(meta(Idx2), S1, []),
     %% expect all members to be stopping now
     %% replicas will receive downs however as will typically exit if leader does
     %% this is ok
-    ?assertMatch([{aux, {stop, StreamId, N1, E,  _}},
-                  {aux, {stop, StreamId, N2, E, _}},
-                  {aux, {stop, StreamId, N3, E, _}}], lists:sort(Actions)),
+    ?assertMatch(
+       [{aux, {stop, StreamId,
+               #{node := N1, epoch := E, index := Idx2},
+               #{node := N1, epoch := E}}},
+        {aux, {stop, StreamId,
+               #{node := N2, epoch := E, index := Idx2},
+               #{node := N2, epoch := E}}},
+        {aux, {stop, StreamId,
+               #{node := N3, epoch := E, index := Idx2},
+               #{node := N3, epoch := E}}}], lists:sort(Actions)),
     ?assertMatch(#stream{members = #{N1 := #member{role = {writer, E},
                                                    current = stopping,
                                                    state = {down, E}},
@@ -1598,18 +1621,22 @@ leader_down_test() ->
     %% idempotency check
     {S2, []} = evaluate_stream(meta(?LINE), S2, []),
     N2Tail = {E, 101},
-    S3 = update_stream(meta(?LINE), {member_stopped, StreamId, #{node => N2,
-                                                                 epoch => E,
-                                                                 tail => N2Tail}}, S2),
+    S3 = update_stream(meta(?LINE), {member_stopped, StreamId,
+                                     #{node => N2,
+                                       index => Idx2,
+                                       epoch => E,
+                                       tail => N2Tail}}, S2),
     ?assertMatch(#stream{members = #{N2 := #member{role = {replica, E},
                                                    current = undefined,
                                                    state = {stopped, E, N2Tail}}}},
                  S3),
     {S3, []} = evaluate_stream(meta(?LINE), S3, []),
     N3Tail = {E, 102},
-    S4 = update_stream(meta(?LINE), {member_stopped, StreamId, #{node => N3,
-                                                                 epoch => E,
-                                                                 tail => N3Tail}}, S3),
+    S4 = update_stream(meta(?LINE), {member_stopped, StreamId,
+                                     #{node => N3,
+                                       index => Idx2,
+                                       epoch => E,
+                                       tail => N3Tail}}, S3),
     E2 = E + 1,
     ?assertMatch(#stream{members = #{N1 := #member{role = {replica, E2},
                                                    current = stopping,
@@ -1625,8 +1652,9 @@ leader_down_test() ->
                  S4),
     {S5, Actions4} = evaluate_stream(meta(?LINE), S4, []),
     %% new leader has been selected so should be started
-    ?assertMatch([{aux, {start_writer, StreamId, #{leader_node := N3}}}],
-                  lists:sort(Actions4)),
+    ?assertMatch([{aux, {start_writer, StreamId, #{node := N3},
+                         #{leader_node := N3}}}],
+                 lists:sort(Actions4)),
     ?assertMatch(#stream{epoch = E2}, S5),
 
     E2LeaderPid = fake_pid(n3),
@@ -1646,7 +1674,8 @@ leader_down_test() ->
                  S6),
     {S7, Actions6} = evaluate_stream(meta(?LINE), S6, []),
     ?assertMatch([{aux, {update_mnesia, _, _}},
-                  {aux, {start_replica, StreamId, N2,
+                  {aux, {start_replica, StreamId,
+                         #{node := N2},
                          #{leader_pid := E2LeaderPid}}}],
                  lists:sort(Actions6)),
     ?assertMatch(#stream{members = #{N1 := #member{role = {replica, E2},
@@ -1691,6 +1720,7 @@ leader_down_test() ->
     N1Tail = {1, 107},
     S11 = update_stream(meta(?LINE),
                         {member_stopped, StreamId, #{node => N1,
+                                                     index => Idx2,
                                                      epoch => E2,
                                                      tail => N1Tail}}, S10),
     %% skip straight to ready as cluster is already operative
@@ -1707,7 +1737,6 @@ leader_down_test() ->
                                                    current = starting,
                                                    state = {ready, E2}}}},
                  S12),
-
     ok.
 
 replica_down_test() ->
@@ -1759,17 +1788,20 @@ leader_start_failed_test() ->
     N3 = node(Replica2),
 
     S0 = started_stream(StreamId, LeaderPid, ReplicaPids),
-    S1 = update_stream(meta(?LINE), {down, LeaderPid, boom}, S0),
-    {S2, _Actions} = evaluate_stream(meta(?LINE), S1, []),
+    Idx2 = ?LINE,
+    S1 = update_stream(meta(Idx2), {down, LeaderPid, boom}, S0),
+    {S2, _Actions} = evaluate_stream(meta(Idx2), S1, []),
     %% leader was down but a temporary reconnection allowed the stop to complete
     S3 = update_stream(meta(?LINE),
                        {member_stopped, StreamId, #{node => N1,
+                                                    index => Idx2,
                                                     epoch => E,
                                                     tail => {1, 2}}}, S2),
 
     {S3, []} = evaluate_stream(meta(?LINE), S3, []),
     S4 = update_stream(meta(?LINE),
                        {member_stopped, StreamId, #{node => N2,
+                                                    index => Idx2,
                                                     epoch => E,
                                                     tail => {1, 1}}}, S3),
     E2 = E+1,
@@ -1795,13 +1827,15 @@ leader_start_failed_test() ->
                                                    state = {running, E, _}}}},
                  S6),
     % E3 = E2+1,
-    {S7, Actions6} = evaluate_stream(meta(?LINE), S6, []),
-    ?assertMatch([{aux, {stop, StreamId, N1, E2, _}},
-                  {aux, {stop, StreamId, N2, E2, _}}
+    Idx7 = ?LINE,
+    {S7, Actions6} = evaluate_stream(meta(Idx7), S6, []),
+    ?assertMatch([{aux, {stop, StreamId, #{node := N1, epoch := E2}, _}},
+                  {aux, {stop, StreamId, #{node := N2, epoch := E2}, _}}
                  ], lists:sort(Actions6)),
     %% late stop from prior epoch - need to run stop again to make sure
     S8 = update_stream(meta(?LINE),
                        {member_stopped, StreamId, #{node => N3,
+                                                    index => Idx2,
                                                     epoch => E,
                                                     tail => {1, 1}}}, S7),
     ?assertMatch(#stream{members = #{N1 := #member{role = {writer, E2},
@@ -1818,7 +1852,7 @@ leader_start_failed_test() ->
                                                    state = {stopped, E, _}}}},
                  S8),
     {_S9, Actions8} = evaluate_stream(meta(?LINE), S8, []),
-    ?assertMatch([{aux, {stop, StreamId, N3, E2, _}}
+    ?assertMatch([{aux, {stop, StreamId, #{node := N3, epoch := E2}, _}}
                  ], lists:sort(Actions8)),
 
 

@@ -510,17 +510,18 @@ recover(Config) ->
     publish(Ch, Q),
     quorum_queue_utils:wait_for_messages(Config, [[Q, <<"1">>, <<"1">>, <<"0">>]]),
 
-    Servers = Servers0,
-    [rabbit_ct_broker_helpers:stop_node(Config, S) || S <- Servers],
-    [rabbit_ct_broker_helpers:start_node(Config, S) || S <- lists:reverse(Servers)],
-    quorum_queue_utils:wait_for_messages(Config, [[Q, <<"1">>, <<"1">>, <<"0">>]]),
-    % [begin
-    %      ct:pal("recover: running stop start for permuation ~w", [Servers]),
-    %      [rabbit_ct_broker_helpers:stop_node(Config, S) || S <- Servers],
-    %      [rabbit_ct_broker_helpers:start_node(Config, S) || S <- lists:reverse(Servers)],
-    %      ct:pal("recover: running stop waiting for messages ~w", [Servers]),
-    %      quorum_queue_utils:wait_for_messages(Config, [[Q, <<"1">>, <<"1">>, <<"0">>]])
-    %  end || Servers <- permute(Servers0)],
+    % [A, B, C] = Servers0,
+    % Servers = [A, C, B],
+    % [rabbit_ct_broker_helpers:stop_node(Config, S) || S <- Servers],
+    % [rabbit_ct_broker_helpers:start_node(Config, S) || S <- lists:reverse(Servers)],
+    % quorum_queue_utils:wait_for_messages(Config, [[Q, <<"1">>, <<"1">>, <<"0">>]]),
+    [begin
+         ct:pal("recover: running stop start for permuation ~w", [Servers]),
+         [rabbit_ct_broker_helpers:stop_node(Config, S) || S <- Servers],
+         [rabbit_ct_broker_helpers:start_node(Config, S) || S <- lists:reverse(Servers)],
+         ct:pal("recover: running stop waiting for messages ~w", [Servers]),
+         quorum_queue_utils:wait_for_messages(Config, [[Q, <<"1">>, <<"1">>, <<"0">>]], 120)
+     end || Servers <- permute(Servers0)],
 
     Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server),
     publish(Ch1, Q),
